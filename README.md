@@ -1,13 +1,13 @@
 # firefox-stream-fetch
 
-在 Firefox **CDM 解密完成后、解码开始前**截获原始视频码流，输出为可重封装的 `.fragment.mp4`。
+在 Firefox **CDM 解密完成后、解码开始前**截获原始视频码流，输出为 H.264 Annex B 裸流（可被 ffplay 直接播放，或用 ffmpeg `-c copy` 重封装为 mp4）。
 
 ## 与姊妹项目的关系
 
 | 项目 | hook 点 | 输出格式 | 画质 |
 |---|---|---|---|
 | [firefox-frame-dump](../firefox-re) | FFmpegVideoDecoder 输出（YUV 像素） | 裸 I420 `.yuv` 文件 | 必须再编码，**有损** |
-| **firefox-stream-fetch（本项目）** | MSE+CDM 输出（H.264 码流） | Fragment MP4 序列 | **无损** |
+| **firefox-stream-fetch（本项目）** | MSE+CDM 输出（H.264 码流） | Annex B `.h264` 裸流 | **无损** |
 
 ## 研究目标
 
