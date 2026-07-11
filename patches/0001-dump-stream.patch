@@ -1,0 +1,125 @@
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index 2431292a5b..2e30dfa33c 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -7,10 +7,14 @@
+ #include "MediaFormatReader.h"
+ 
+ #include <algorithm>
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
+ #include <map>
+ #include <queue>
+ 
+ #include "AllocationPolicy.h"
++#include "AnnexB.h"
+ #ifdef MOZ_AV1
+ #  include "AOMDecoder.h"
+ #endif
+@@ -54,6 +58,94 @@ mozilla::LazyLogModule gMediaDemuxerLog("MediaDemuxer");
+ 
+ #define NS_DispatchToMainThread(...) CompileError_UseAbstractMainThreadInstead
+ 
++// Dump decrypted-but-still-compressed video samples to /tmp/moz_stream.h264.
++// Hooked at: after CDM decryption, before decoder input.
++// Output: H.264 Annex B bytestream with SPS/PPS prepended, ready for `ffplay
++//         -f h264 -i /tmp/moz_stream.h264` or remux with `ffmpeg -c copy`.
++class StreamDumper {
++ public:
++  static void Dump(mozilla::TrackType aTrack, mozilla::MediaRawData* aSample) {
++    if (!aSample) return;
++    if (aTrack != mozilla::TrackInfo::kVideoTrack) return;
++
++    auto info = aSample->mTrackInfo;
++    if (!info) return;
++    auto* vi = info->GetAsVideoInfo();
++    if (!vi) return;
++    // Only H.264 AVC for now; HEVC/VP9/AV1 use different bsf.
++    NS_ConvertASCIItoUTF16 mime(vi->mMimeType);
++    if (!mime.EqualsLiteral(u"video/avc")) {
++      static bool sUnsupportedLogged = false;
++      if (!sUnsupportedLogged) {
++        std::fprintf(stderr,
++                     "[StreamDumper] non-H.264 track (mime=%s), skipping\n",
++                     vi->mMimeType.begin());
++        sUnsupportedLogged = true;
++      }
++      return;
++    }
++
++    static FILE* sFile = nullptr;
++    if (!sFile) {
++      const char* path = std::getenv("MOZ_STREAM_DUMP_PATH");
++      if (!path || !*path) path = "/tmp/moz_stream.h264";
++      sFile = std::fopen(path, "wb");
++      if (!sFile) {
++        std::fprintf(stderr,
++                     "[StreamDumper] failed to open %s (errno=%d %s), trying "
++                     "$HOME/moz_stream.h264\n",
++                     path, errno, std::strerror(errno));
++        sFile = std::fopen("/home/wangyc/moz_stream.h264", "wb");
++        if (!sFile) {
++          std::fprintf(stderr, "[StreamDumper] all paths failed, disabled\n");
++          return;
++        }
++      }
++      std::fprintf(stderr, "[StreamDumper] writing H.264 stream to %s\n",
++                   path);
++    }
++
++    RefPtr<mozilla::MediaRawData> clone = aSample->Clone();
++    if (!clone) return;
++
++    static bool sHeaderWritten = false;
++    if (!sHeaderWritten) {
++      // Convert AVCC extradata (avcC box) to Annex B header (SPS+PPS).
++      if (clone->mExtraData) {
++        RefPtr<mozilla::MediaByteBuffer> spsPps =
++            mozilla::AnnexB::ConvertAVCCExtraDataToAnnexB(clone->mExtraData);
++        if (spsPps && spsPps->Length() > 0) {
++          std::fwrite(spsPps->Data(), 1, spsPps->Length(), sFile);
++          std::fprintf(stderr,
++                       "[StreamDumper] wrote %zu bytes of SPS/PPS header\n",
++                       spsPps->Length());
++        }
++      }
++      sHeaderWritten = true;
++    }
++
++    // Convert AVCC sample (length-prefixed NALUs) to Annex B (start codes).
++    if (mozilla::AnnexB::ConvertAVCCSampleToAnnexB(clone).isOk()) {
++      static uint64_t sFrameCount = 0;
++      std::fwrite(clone->Data(), 1, clone->Size(), sFile);
++      std::fflush(sFile);
++      if (++sFrameCount <= 3 || sFrameCount % 100 == 0) {
++        std::fprintf(stderr,
++                     "[StreamDumper] frame=%llu time=%lldus size=%zu\n",
++                     (unsigned long long)sFrameCount,
++                     (long long)aSample->mTime.ToMicroseconds(),
++                     aSample->Size());
++      }
++    } else {
++      static bool sConvErrLogged = false;
++      if (!sConvErrLogged) {
++        std::fprintf(stderr, "[StreamDumper] ConvertAVCCSampleToAnnexB failed\n");
++        sConvErrLogged = true;
++      }
++    }
++  }
++};
++
+ namespace mozilla {
+ 
+ using MediaDataDecoderID = void*;
+@@ -2246,6 +2338,10 @@ void MediaFormatReader::HandleDemuxedSamples(
+     aA.mStats.mParsedFrames++;
+   }
+ 
++  // StreamDumper: capture the decrypted (still-compressed) H.264 sample
++  // before it enters the decoder.
++  StreamDumper::Dump(aTrack, sample);
++
+   DecodeDemuxedSamples(aTrack, sample);
+ 
+   decoder.mQueuedSamples.RemoveElementAt(0);
