@@ -1,38 +1,151 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] dump: capture decrypted H.264 stream pre-decode
+
+Capture decrypted-but-still-compressed H.264 video samples at two points
+in MediaFormatReader, dumping to a local .h264 Annex B file (compatible
+with `ffplay -f h264` and `ffmpeg -c copy`):
+
+  1. OnVideoDemuxCompleted — samples leaving the demuxer. Fires for
+     MSE/CDM-driven paths (HLS, EME+Widevine, etc.).
+
+  2. HandleDemuxedSamples — samples entering the decoder. Fires for
+     direct src= file:// or http(s):// MP4 paths (no MSE involved).
+     This is needed because MP4Demuxer leaves sample->mTrackInfo NULL,
+     so we must source the TrackInfo from the decoder's
+     GetCurrentInfo() (which falls back to mOriginalInfo).
+
+Output: SPS/PPS (Annex B header) + per-sample NALUs with start codes.
+File path: $MOZ_STREAM_DUMP_PATH (default /tmp/moz_stream.h264).
+
 diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
-index 2e30dfa33c..a09f02441a 100644
 --- a/dom/media/MediaFormatReader.cpp
 +++ b/dom/media/MediaFormatReader.cpp
-@@ -64,7 +64,7 @@ mozilla::LazyLogModule gMediaDemuxerLog("MediaDemuxer");
+@@ -55,6 +55,99 @@
  //         -f h264 -i /tmp/moz_stream.h264` or remux with `ffmpeg -c copy`.
- class StreamDumper {
-  public:
--  static void Dump(mozilla::TrackType aTrack, mozilla::MediaRawData* aSample) {
-+  static void Dump(mozilla::TrackInfo::TrackType aTrack, mozilla::MediaRawData* aSample) {
-     if (!aSample) return;
-     if (aTrack != mozilla::TrackInfo::kVideoTrack) return;
- 
-@@ -73,13 +73,12 @@ class StreamDumper {
-     auto* vi = info->GetAsVideoInfo();
-     if (!vi) return;
-     // Only H.264 AVC for now; HEVC/VP9/AV1 use different bsf.
--    NS_ConvertASCIItoUTF16 mime(vi->mMimeType);
--    if (!mime.EqualsLiteral(u"video/avc")) {
+
++// Dump decrypted-but-still-compressed video samples to a local .h264 file.
++// See doc above Dump() for hook points and behavior.
++class StreamDumper {
++ public:
++  static void Dump(mozilla::TrackInfo::TrackType aTrack,
++                   mozilla::MediaRawData* aSample,
++                   const mozilla::TrackInfo* aInfo = nullptr) {
++    static int sCallCount = 0;
++    if (sCallCount < 3 || (sCallCount % 100 == 0)) {
++      std::fprintf(stderr, "[StreamDumper] Dump call #%d track=%d\n",
++                   sCallCount, (int)aTrack);
++    }
++    ++sCallCount;
++    if (!aSample) return;
++    if (aTrack != mozilla::TrackInfo::kVideoTrack) return;
++
++    // Prefer TrackInfo* passed in by the caller (decoder's current
++    // TrackInfo, which is reliable for both direct src=MP4 and MSE paths).
++    // Fall back to sample->mTrackInfo (set by some demuxers like HLS).
++    // MP4Demuxer leaves sample->mTrackInfo NULL — TrackInfo from the
++    // decoder is the only reliable source.
++    const mozilla::TrackInfo* ti = aInfo;
++    if (!ti && aSample->mTrackInfo) {
++      ti = aSample->mTrackInfo->operator->();
++    }
++    if (!ti) return;
++    auto* vi = ti->GetAsVideoInfo();
++    if (!vi) return;
++    // Only H.264 AVC for now; HEVC/VP9/AV1 use different bsf.
 +    if (!vi->mMimeType.EqualsLiteral("video/avc")) {
-       static bool sUnsupportedLogged = false;
-       if (!sUnsupportedLogged) {
-         std::fprintf(stderr,
-                      "[StreamDumper] non-H.264 track (mime=%s), skipping\n",
--                     vi->mMimeType.begin());
++      static bool sUnsupportedLogged = false;
++      if (!sUnsupportedLogged) {
++        std::fprintf(stderr,
++                     "[StreamDumper] non-H.264 track (mime=%s), skipping\n",
 +                     vi->mMimeType.get());
-         sUnsupportedLogged = true;
-       }
-       return;
-@@ -115,7 +114,7 @@ class StreamDumper {
-         RefPtr<mozilla::MediaByteBuffer> spsPps =
-             mozilla::AnnexB::ConvertAVCCExtraDataToAnnexB(clone->mExtraData);
-         if (spsPps && spsPps->Length() > 0) {
--          std::fwrite(spsPps->Data(), 1, spsPps->Length(), sFile);
++        sUnsupportedLogged = true;
++      }
++      return;
++    }
++
++    static FILE* sFile = nullptr;
++    if (!sFile) {
++      const char* path = std::getenv("MOZ_STREAM_DUMP_PATH");
++      if (!path || !*path) path = "/tmp/moz_stream.h264";
++      sFile = std::fopen(path, "wb");
++      if (!sFile) {
++        std::fprintf(stderr,
++                     "[StreamDumper] failed to open %s (errno=%d %s), trying "
++                     "$HOME/moz_stream.h264\n",
++                     path, errno, std::strerror(errno));
++        sFile = std::fopen("/home/wangyc/moz_stream.h264", "wb");
++        if (!sFile) {
++          std::fprintf(stderr, "[StreamDumper] all paths failed, disabled\n");
++          return;
++        }
++      }
++      std::fprintf(stderr, "[StreamDumper] writing H.264 stream to %s\n",
++                   path);
++    }
++
++    RefPtr<mozilla::MediaRawData> clone = aSample->Clone();
++    if (!clone) return;
++
++    static bool sHeaderWritten = false;
++    if (!sHeaderWritten) {
++      // Convert AVCC extradata (avcC box) to Annex B header (SPS+PPS).
++      if (clone->mExtraData) {
++        RefPtr<mozilla::MediaByteBuffer> spsPps =
++            mozilla::AnnexB::ConvertAVCCExtraDataToAnnexB(clone->mExtraData);
++        if (spsPps && spsPps->Length() > 0) {
 +          std::fwrite(spsPps->Elements(), 1, spsPps->Length(), sFile);
-           std::fprintf(stderr,
-                        "[StreamDumper] wrote %zu bytes of SPS/PPS header\n",
-                        spsPps->Length());
++          std::fprintf(stderr,
++                       "[StreamDumper] wrote %zu bytes of SPS/PPS header\n",
++                       spsPps->Length());
++        }
++      }
++      sHeaderWritten = true;
++    }
++
++    // Convert AVCC sample (length-prefixed NALUs) to Annex B (start codes).
++    if (mozilla::AnnexB::ConvertAVCCSampleToAnnexB(clone).isOk()) {
++      static uint64_t sFrameCount = 0;
++      std::fwrite(clone->Data(), 1, clone->Size(), sFile);
++      std::fflush(sFile);
++      if (++sFrameCount <= 3 || sFrameCount % 100 == 0) {
++        std::fprintf(stderr,
++                     "[StreamDumper] frame=%llu time=%lldus size=%zu\n",
++                     (unsigned long long)sFrameCount,
++                     (long long)aSample->mTime.ToMicroseconds(),
++                     aSample->Size());
++      }
++    } else {
++      static bool sConvErrLogged = false;
++      if (!sConvErrLogged) {
++        std::fprintf(stderr, "[StreamDumper] ConvertAVCCSampleToAnnexB failed\n");
++        sConvErrLogged = true;
++      }
++    }
++  }
++};
++
+ namespace mozilla {
+
+@@ -1729,6 +1822,11 @@ void MediaFormatReader::OnVideoDemuxCompleted(
+   // This is the cleanest hook — fires whenever the MP4 demuxer produces a
+   // sample, regardless of decoder-state conditions.
+   for (const auto& sample : aSamples->GetSamples()) {
++    StreamDumper::Dump(TrackInfo::kVideoTrack, sample);
+   }
+ }
+
+@@ -2350,6 +2448,11 @@ void MediaFormatReader::HandleDemuxedSamples(
+   decoder.mNumSamplesInput++;
+   decoder.mSizeOfQueue++;
+   if (aTrack == TrackInfo::kVideoTrack) {
+     aA.mStats.mParsedFrames++;
+   }
+
++  // StreamDumper (alt hook): call before decoding; fires for direct src=MP4
++  // and other paths that don't go through OnVideoDemuxCompleted.
++  // Use GetCurrentInfo() which falls back to mOriginalInfo (set in AsyncReadMetadata).
++  StreamDumper::Dump(aTrack, sample, decoder.GetCurrentInfo());
++
+   DecodeDemuxedSamples(aTrack, sample);
+
+   decoder.mQueuedSamples.RemoveElementAt(0);

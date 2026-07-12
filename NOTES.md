@@ -61,33 +61,70 @@ Mozilla 用 Unified_cpp_dom_media*.cpp 把多个 .cpp 合并编译。文件被 `
 
 ## 运行时验证
 
-### 测试环境
+### 7/11 测试（Xvfb headless）
 - Xvfb :99 (1920x1080)
 - 加载 `file:///tmp/test-stream2.html`
 - HTML 内 `<video src="...BigBuckBunny.mp4" autoplay controls muted>`
 - 设置 `MOZ_STREAM_DUMP_PATH=/tmp/moz_stream_dumps/...h264`
 
-### 结果
-- ❌ dump 文件未生成
-- ❌ firefox-stderr.log 0 bytes
-- ❌ 同样的现象 firefox-re 的 YUV 版也出现
+**结果**: ❌ dump 文件未生成，stderr 0 bytes。怀疑 headless autoplay 被阻止。
 
-### 推测原因
-- Xvfb headless 环境中 audio/video autoplay 自动被阻止
-- HTML5 video 元素可能因为无音频 sink 而无法自动进入 playing 状态
-- **跟 patch 本身无关**——基础设施层面问题
+### 7/12 重新验证（真实显示器 :1）
 
-### 解决办法（待用户手动测试）
-1. 在真实桌面环境（有 X11/Wayland 显示器）手动启动 firefox
-2. 播放 Widevine L3 内容
-3. 实时观察 dump 文件增长
-4. 用 `ffplay -f h264 /tmp/moz_stream.h264` 验证
+实际推断错了。真实显示器 `:1` 上跑后，**确认 hook 点位置错误**：
+
+#### 诊断过程
+
+1. **第一次跑**: hook 只挂在 `OnVideoDemuxCompleted`，stderr 全空，`/tmp/test-dump.h264` 句柄从没打开
+2. **加诊断**: 让 `Dump` 入口往 `/tmp/sd-diag.log` 写 call id
+   - 结果：日志里 **0 条 StreamDumper 调用** —— hook 完全不触发
+3. **加第二个 hook 点**: `HandleDemuxedSamples` 里的 `DecodeDemuxedSamples` 之前
+   - 结果：dump 头几个 NALU 出现，但 `!info` early-return —— **aSample->mTrackInfo 是 null**
+4. **根因**: MP4Demuxer 的 `GetNextSample()` 从不解码器侧设置 mTrackInfo
+   - 只设了 mExtraData 和 mKeyframe（[MP4Demuxer.cpp:407](firefox/dom/media/mp4/MP4Demuxer.cpp#L407)）
+   - HLSDemuxer / TrackBuffersManager / MediaChangeMonitor 都设，**唯独 MP4Demuxer 不设**
+5. **修复**: StreamDumper 接受可选 `const TrackInfo* aInfo` 参数
+   - 调用方传 `decoder.GetCurrentInfo()`（自动 fallback 到 mOriginalInfo）
+6. **结果**: ✅ 完整 dump
+
+#### 诊断输出
+
+```
+[StreamDumper] Dump call #0 track=2
+[StreamDumper] writing H.264 stream to /tmp/moz_stream_dumps/verify-20260712-203606.h264
+[StreamDumper] wrote 34 bytes of SPS/PPS header
+[StreamDumper] frame=1 time=0us size=23362
+[StreamDumper] frame=2 time=40000us size=31957
+...
+[StreamDumper] frame=500 time=9960000us size=31328
+```
+
+**dump 文件**: 16MB, 25fps, 1280x720 H.264 baseline
+**ffprobe**: 完全识别（width/height/profile/level/pix_fmt 全部 OK）
+**ffmpeg -c copy 转封装**: 成功 913 帧 36.5s mp4（中途截屏），与原测试 mp4 画质一致
+
+#### 双 hook 点
+
+保留两个 hook，覆盖两条路径：
+- `OnVideoDemuxCompleted` —— **MSE / EME+CDM 路径**（HLS、ClearKey、Widevine L3）
+- `HandleDemuxedSamples` —— **直接 src=MP4 路径**（file://, http(s):// 直链）
+
+后者传 `decoder.GetCurrentInfo()`，绕过 MP4Demuxer 不设 mTrackInfo 的坑。
+
+#### 验证工具
+
+- `scripts/verify-stream.sh` — 启 firefox 加载测试 mp4，每 5s 探测 dump
+- `scripts/check-video.py` / `tmp/bidi-full.py` — BiDi WebDriver 查询 video.readyState
+- 关键环境变量：`DISPLAY=:1`, `XAUTHORITY=/run/user/1000/gdm/Xauthority`,
+  Firefox 启动加 `-remote-allow-origins '*'`，WebSocket 客户端用 `suppress_origin=True`
 
 ## 关键产物
 - `obj-stream/dist/bin/firefox` (7.1MB)
-- `obj-stream/dist/bin/libxul.so` (3.4GB, 16 处 StreamDumper 符号)
+- `obj-stream/dist/bin/libxul.so` (3.4GB, 16+ 处 StreamDumper 符号)
 - `obj-stream/dist/bin/widevine/libwidevinecdm.so` (21MB, 从 Chrome 抠出)
-- `patches/0001-dump-stream.patch` (1.8KB, 96+ 行 +5/-0)
+- `patches/0001-dump-stream.patch` (含 StreamDumper 类 + 双 hook 点)
+- `scripts/verify-stream.sh` (验证脚本)
+- `scripts/check-video.py` + `tmp/bidi-full.py` (BiDi 诊断)
 
 ## GitHub
 https://github.com/WangYunchao2023/firefox-stream-fetch

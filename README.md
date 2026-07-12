@@ -40,8 +40,10 @@ firefox-stream-fetch/
 
 - [x] 仓库创建，目录骨架
 - [x] GitHub 仓库链接
-- [ ] 定位 hook 点
-- [ ] 写 patch
+- [x] 定位 hook 点（MediaFormatReader::HandleDemuxedSamples + OnVideoDemuxCompleted 双 hook）
+- [x] 写 patch
+- [x] 编译 + 本地 mp4 验证通过（913 帧 36.5s mp4 dump，可 ffplay/转封装）
+- [ ] Widevine L3 真实内容验证（需手动播放确认 hook 对 EME 路径同样工作）
 - [ ] 编译 + 测试
 
 ## 限制
