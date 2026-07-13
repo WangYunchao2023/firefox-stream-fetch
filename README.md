@@ -46,6 +46,42 @@ firefox-stream-fetch/
 - [ ] Widevine L3 真实内容验证（需手动播放确认 hook 对 EME 路径同样工作）
 - [ ] 编译 + 测试
 
+
+## 版本记录
+
+### v1.1.0 (2026-07-13)
+
+**新增 video/av1 支持 + IVF 容器自动包装 + codec-aware 文件后缀**
+
+改动：
+- `dom/media/MediaFormatReader.cpp`：StreamDumper class 加 `video/av1` codec dispatch
+- AV1 sample 走 IVF 容器自动包装路径：32-byte IVF file header + 每个 sample 一个 IVF frame（12-byte frame header + OBU 字节流）
+- 自动按 codec 选择文件后缀：
+  - H.264 → `/tmp/moz_stream.h264`
+  - HEVC  → `/tmp/moz_stream.h265`
+  - AV1   → `/tmp/moz_stream.av1`
+  - 显式 `MOZ_STREAM_DUMP_PATH=xxx` 时按字面路径写
+- AV1 第 1 帧 prepend `mExtraData[4:]`（跳过 av1C config 的 4 字节，留 OBU(s)），让 IVF frame 自带 init
+
+新脚本：
+- `scripts/capture-youtube.sh` — 持久化 profile + YouTube AV1 抓取（自动 IVF）
+- `scripts/capture-olevod.sh` — olevod.com H.264 直连，**无代理**（olerod 直连可达）
+- `scripts/capture-yfsp.sh` — yfsp.tv 测试脚本，含 CF cookie 持久化
+
+验证（YouTube `_n4SRDYkhqs`）：
+- 39MB IVF/AV1 自动写出
+- ffprobe: AV1 Main, 1080×608, yuv420p, BT.709
+- ffmpeg 抽帧：拿到真实视频帧画面（两人在工作室）
+
+Patches：
+- `patches/0001-dump-stream.patch` — v1.0.0 H.264 dump
+- `patches/0002-add-av1-support.patch` — v1.1.0 codec dispatch
+- `patches/0003-codec-aware-output.patch` — v1.1.0 IVF + auto-suffix
+
+### v1.0.0 (2026-07-11)
+
+初始发布：H.264 dump，Annex B + SPS/PPS。
+
 ## 限制
 
 - 仅对 **L3 软件解密**有效（桌面 Linux 默认）
