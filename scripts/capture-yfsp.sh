@@ -10,25 +10,42 @@ mkdir -p "$DUMP_DIR"
 # === 【每次跑都强制同步】代理 prefs 进 prefs.js ===
 # user.js 里写了 network.proxy.*，但只在 profile 不存在时执行；
 # 已有 profile 时，旧 prefs.js 里还残留上次错的 http://19090 proxy。
-# 这里补丁 prefs.js 让 SOCKS5 必定生效。
+# 这里补丁 prefs.js 让 SOCKS5 必定生效，并纠正 anti-fingerprint 配置。
 if [ -d "$PROFILE" ]; then
     PJS="$PROFILE/prefs.js"
     if [ -f "$PJS" ]; then
-        # 先干掉旧的 http_proxy 行
-        sed -i '/user_pref("network\.proxy\.http"/d; /user_pref("network\.proxy\.ssl"/d; /user_pref("network\.proxy\.type"/d; /user_pref("network\.proxy\.socks"/d; /user_pref("network\.proxy\.socks_port"/d; /user_pref("network\.proxy\.socks_version"/d; /user_pref("network\.proxy\.socks_remote_dns"/d; /user_pref("network\.proxy\.no_proxies_on"/d' "$PJS" 2>/dev/null || true
+        # 先干掉旧的反指纹 / WebGL 错误配置（保留 network.proxy.* 干掉旧 key）
+        sed -i \
+            -e '/user_pref("general\.useragent\.override"/d' \
+            -e '/user_pref("webgl\.software-renderer\.enable"/d' \
+            -e '/user_pref("webgl\.out-of-process"/d' \
+            -e '/user_pref("network\.proxy\.http"/d' \
+            -e '/user_pref("network\.proxy\.ssl"/d' \
+            -e '/user_pref("network\.proxy\.type"/d' \
+            -e '/user_pref("network\.proxy\.socks"/d' \
+            -e '/user_pref("network\.proxy\.socks_port"/d' \
+            -e '/user_pref("network\.proxy\.socks_version"/d' \
+            -e '/user_pref("network\.proxy\.socks_remote_dns"/d' \
+            -e '/user_pref("network\.proxy\.no_proxies_on"/d' \
+            "$PJS" 2>/dev/null || true
         cat >> "$PJS" <<'EP'
-// === firefox-stream-fetch: 强制走 aurora SOCKS5 (7/14 修) ===
+// === firefox-stream-fetch: 强制走 aurora SOCKS5 + 反指纹修复 (7/14 二次修) ===
 user_pref("network.proxy.type", 1);
 user_pref("network.proxy.socks", "127.0.0.1");
 user_pref("network.proxy.socks_port", 29290);
 user_pref("network.proxy.socks_version", 5);
 user_pref("network.proxy.socks_remote_dns", true);
 user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
-// === WebGL 稳定性 ===
-user_pref("webgl.out-of-process", false);
-user_pref("webgl.software-renderer.enable", true);
-user_pref("webgl.disable-fail-if-major-performance-caveat", true);
-user_pref("webgl.force-layers-readback", false);
+// 用 Firefox 真实 UA（不要 Chrome UA 跳 Firefox，会被 CF 看作 bot）
+user_pref("general.useragent.updates.enabled", true);
+user_pref("general.useragent.complexOverride", true);
+// ETP：开 standard，CF 检查这个
+user_pref("browser.contentblocking.category", "standard");
+user_pref("privacy.trackingprotection.enabled", true);
+user_pref("intl.accept_languages", "en-US,en;q=0.9");
+user_pref("intl.locale.requested", "en-US");
+// WebGL：硬件加速，绝对不要 software renderer
+user_pref("webgl.software-renderer.enable", false);
 EP
     fi
 fi
@@ -62,16 +79,27 @@ user_pref("gfx.compositor.glcontext", true);
 user_pref("media.hardware-video-decoding.enabled", true);
 user_pref("media.ffmpeg.vaapi.enabled", true);
 
-// === 反指纹：仿 Chrome 的 User-Agent (提高 CF 通过率) ===
-user_pref("general.useragent.override", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+// === 反指纹：不要改 UA ！让 Firefox 用真实 UA ===
+//   改 Chrome UA 跑 Firefox 反而被 CF 识别为 bot
+user_pref("general.useragent.updates.enabled", true);
+user_pref("general.useragent.complexOverride", true);
 
 // === WebRTC 内网保护 ===
 user_pref("media.peerconnection.ice.default_address_only", true);
 user_pref("media.peerconnection.ice.no_host", true);
 
-// === Navigator 信息补全（让指纹更接近正常 Chrome）===
+// === Navigator 信息补全（让指纹看起来是个正常用户）===
 user_pref("dom.webdriver.enabled", false);
 user_pref("privacy.resistFingerprinting", false);
+
+// === ETP (Enhanced Tracking Protection) — CF 看这个 ===
+user_pref("browser.contentblocking.category", "standard");
+user_pref("network.cookie.cookieBehavior", 4);   // 4=reject all 3rd party cookies（默认）
+user_pref("privacy.trackingprotection.enabled", true);
+
+// === 语言 / 时区 — 跟 SOCKS5 出口 IP 区域一致（这里默认 en-US）===
+user_pref("intl.accept_languages", "en-US,en;q=0.9");
+user_pref("intl.locale.requested", "en-US");
 
 // === 代理：aurora-slim 的 SOCKS5 (29290) 才能走 HTTPS ===
 //   19090 是 HTTP forward proxy，不支持 CONNECT，HTTPS 走它会 405
@@ -84,18 +112,26 @@ user_pref("network.proxy.socks_version", 5);
 user_pref("network.proxy.socks_remote_dns", true);
 user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
 
-// === WebGL 稳定性（避免 CF Turnstile "context lost" 死循环）===
-// 关掉 GPU process / sandbox 让 WebGL 走主进程，少一次 IPC
-user_pref("gfx.webrender.all-angles", true);
-user_pref("webgl.disable-fail-if-major-performance-caveat", true);
+// === WebGL：走硬件加速，绝对不要 software renderer（CF 看作 bot） ===
+//   之前 webgl.software-renderer.enable=true 是错误：让 renderer 变 SwiftShader
+//   CF Turnstile 拿 WebGL UNMASKED_RENDERER_WEBGL 当指纹、SwiftShader → 高风险 → 拒绝 cookie
+user_pref("webgl.force-enabled", true);
+user_pref("webgl.disabled", false);
 user_pref("webgl.force-layers-readback", false);
-// 关掉 GL 沙箱的 reset 检测（避免「context lost」误报）
-user_pref("webgl.enable-image-texture", true);
-// 允许 WebGL 在 software renderer 上跑（CF Turnstile 只需 canvas 着色器）
-user_pref("webgl.software-renderer.enable", true);
-// 不让 WebGL 跨进程（avoid GPU process crash → context lost）
-user_pref("webgl.out-of-process", false);
-// 抑制 deprecated 警告刷屏
+// 硬件加速全开，让 WebGL 走 GPU process
+user_pref("layers.acceleration.force-enabled", true);
+user_pref("gfx.webrender.all", true);
+user_pref("gfx.webrender.layers-free", true);
+user_pref("gfx.compositor.glcontext", true);
+user_pref("media.hardware-video-decoding.enabled", true);
+user_pref("media.ffmpeg.vaapi.enabled", true);
+// 容忍「context lost」（CF challenge 重试是正常现象）
+user_pref("webgl.disable-fail-if-major-performance-caveat", true);
+
+// === 不让 challenge 后页面跳转被中途截断 ===
+user_pref("dom.disable_open_during_load", false);
+
+// === 抑制 deprecated 警告刷屏 ===
 user_pref("dom.webgl.disabled-extensions.warn-on-use", false);
 PJ
     echo "📁 新 profile 创建于 $PROFILE"
