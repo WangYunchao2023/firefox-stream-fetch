@@ -49,6 +49,17 @@ firefox-stream-fetch/
 
 ## 版本记录
 
+### v2.0.0 (2026-07-14)
+
+- **CF Turnstile 反反爬解决方案**：两阶段法
+  - Phase 1：sandbox 正常 → 手动过 CF → cookie 落盘
+  - Phase 2：sandbox 关闭 + cookie 复用 → 自动抓取
+- **capture-generic.sh 通用脚本**：支持任意 URL、session restore、无 URL 模式
+- 自动 ffmpeg 转 .mp4 + 清理中间文件
+- 多集自动抓取（--auto-next）
+- 配置化输出目录（--output，默认 ~/Videos/firefox抓取/）
+- 启动后拉窗口到前台
+
 ### v1.1.0 (2026-07-13)
 
 **新增 video/av1 支持 + IVF 容器自动包装 + codec-aware 文件后缀**
