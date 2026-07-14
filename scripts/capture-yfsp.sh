@@ -85,7 +85,7 @@ PJ
     echo ""
 fi
 
-FF=$(find "$PROJECT/obj-stream" -name "firefox" -type f -executable 2>/dev/null | head -1)
+FF=$(find -L "$PROJECT/obj-stream" -path "*dist/bin/firefox" -type f -executable 2>/dev/null | head -1)
 FF_DIR=$(dirname "$FF")
 echo "✅ Firefox: $FF"
 
