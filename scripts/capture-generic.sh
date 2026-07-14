@@ -83,22 +83,30 @@ HELPEOF
     exit 0
 }
 
-# 第一个无 flag 参数是 URL
-i=1
-for arg in "$@"; do
-    case "$arg" in
-        --output)        i=$((i+1)); OUTPUT_DIR="${!i}";;
-        --auto-next)     AUTO_NEXT=1;;
-        --framerate)     i=$((i+1)); FRAMERATE="${!i}";;
-        --next-stall)    i=$((i+1)); NEXT_STALL="${!i}";;
-        --done-stall)    i=$((i+1)); DONE_STALL="${!i}";;
-        --no-cleanup)    CLEANUP=0;;
-        --help|-h)       print_help;;
-        http*|https*)    [ -z "$URL" ] && URL="$arg";;
-        *)               [ -z "$PROFILE_NAME" ] && PROFILE_NAME="$arg";;
+# 解析参数：shift 模式
+URL=""
+PROFILE_NAME=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --output)       OUTPUT_DIR="$2"; shift 2;;
+        --auto-next)    AUTO_NEXT=1; shift;;
+        --framerate)    FRAMERATE="$2"; shift 2;;
+        --next-stall)   NEXT_STALL="$2"; shift 2;;
+        --done-stall)   DONE_STALL="$2"; shift 2;;
+        --no-cleanup)   CLEANUP=0; shift;;
+        --help|-h)      print_help;;
+        http://*|https://*)
+                        if [ -z "$URL" ]; then URL="$1"; else POSITIONAL+=("$1"); fi; shift;;
+        --*)            echo "未知参数: $1"; exit 1;;
+        *)              POSITIONAL+=("$1"); shift;;
     esac
-    i=$((i+1))
 done
+
+# 第一个位置参数是 PROFILE_NAME
+if [ ${#POSITIONAL[@]} -gt 0 ]; then
+    PROFILE_NAME="${POSITIONAL[0]}"
+fi
 
 [ -z "$URL" ] && { echo "❌ URL 必填"; print_help; }
 
