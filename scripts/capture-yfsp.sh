@@ -1,153 +1,227 @@
 #!/bin/bash
-# yfsp.tv 视频抓取脚本 — 两阶段法
+# yfsp.tv 视频抓取脚本 — 两阶段法（2026-07-14 固化版）
 #
-# 问题：我们的 patched Firefox 在 CF 验证后 WebGL content process 会崩，
-#       但同时关 sandbox 又会被 CF 拒绝发 cookie。
-#       
-# 方案：两阶段
-#   Phase 1: sandbox 开启 → 你手动过 CF → Firefox 崩 → cookie 落盘
-#   Phase 2: sandbox 关闭 → 重启 → cookie 有效 → StreamDumper 写 dump
+# ═══════════════════════════════════════════════════════════════════════
+# 关键发现 / 为什么这样设计
+# ═══════════════════════════════════════════════════════════════════════
+# CF Turnstile 检测 prefs 里两个特征就拒绝发 cf_clearance cookie：
+#   1) general.useragent.override = "Chrome ..."  → Chrome UA 跑 Firefox，bot 信号
+#   2) security.sandbox.*.level = 0  → 全沙箱关闭，bot 信号
 #
+# 解决：
+#   Phase 1: sandbox 开启 + 用 Firefox 真实 UA → 用户手动过 CF → cookie 落盘
+#   Phase 2: 同一 profile + sandbox 关闭（StreamDumper 写文件需要）
+#            + 复制 cookie（cookie 复用）→ 视频播放 → dump
+#
+# 实测：上面这套 + 一次性手动过 CF 后，cookie 复用可持续几小时。
+# ═══════════════════════════════════════════════════════════════════════
 set -e
 
 PROJECT="/home/wangyc/Documents/软件类工作/firefox-stream-fetch"
-PROFILE="/tmp/firefox-yfsp-dump-profile"          # 新的 profile（不与旧冲突）
+PROFILE="/tmp/firefox-yfsp-dump-profile"          # profile 复用（保留 cookie）
 DUMP_DIR="/tmp/moz_stream_dumps"
 FF=$(find -L "$PROJECT/obj-stream" -path "*dist/bin/firefox" -type f -executable 2>/dev/null | head -1)
-FF_DIR=$(dirname "$FF")
-DUMP_FILE="$DUMP_DIR/yfsp-$(date +%Y%m%d-%H%M%S).h264"
-LOG="$DUMP_DIR/yfsp.log"
+[ -z "$FF" ] && { echo "❌ 找不到 firefox"; exit 1; }
+
 mkdir -p "$DUMP_DIR"
+TS=$(date +%Y%m%d-%H%M%S)
+DUMP_FILE="$DUMP_DIR/yfsp-$TS.h264"
+LOG="$DUMP_DIR/yfsp-$TS.log"
 > "$LOG"
 
-# ============================================================
-# Phase 1 — 拿 CF cookie（sandbox 正常）
-# ============================================================
-phase1() {
-    echo ""
-    echo "╔══════════════════════════════════════════════════════╗"
-    echo "║    Phase 1 — 获取 CF cookie（sandbox 正常）         ║"
-    echo "╚══════════════════════════════════════════════════════╝"
-    echo ""
+export DISPLAY=:1
+export XAUTHORITY=/run/user/1000/gdm/Xauthority
 
-    # 清理旧的 profile（确保全新）
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Phase 1 — 拿 CF cookie                                            ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+echo ""
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║  Phase 1 — 获取 cf_clearance（sandbox 正常 + 真实 UA）     ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# 每次都用全新 profile 起点，但若 cookie 已存在则复用
+if [ ! -d "$PROFILE" ]; then
+    mkdir -p "$PROFILE"
+    PROFILE_NEW=1
+else
+    PROFILE_NEW=0
+    # 检查现有 cookie
+    CF_COUNT=$(sqlite3 "$PROFILE/cookies.sqlite" \
+        "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance' AND expiry > strftime('%s','now')" 2>/dev/null || echo "0")
+    if [ "$CF_COUNT" -gt 0 ]; then
+        echo "✅ 检测到现有有效 cf_clearance cookie ($CF_COUNT 个，跳过 CF 验证)"
+        echo "   直接进入 Phase 2..."
+        # 直接进入 Phase 2
+        unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+        unset MOZ_STREAM_DUMP_PATH
+        # 修改 sandbox prefs 让 StreamDumper 能写文件
+        PJS="$PROFILE/prefs.js"
+        if [ -f "$PJS" ]; then
+            sed -i '/user_pref("security\.sandbox/d' "$PJS" 2>/dev/null || true
+        fi
+        cat >> "$PJS" <<'EP'
+// === Phase 2: 关 sandbox 让 StreamDumper 写 /tmp/ ===
+user_pref("security.sandbox.content.level", 0);
+user_pref("security.sandbox.gmp.level", 0);
+user_pref("security.sandbox.rdd.level", 0);
+user_pref("security.sandbox.socket.level", 0);
+user_pref("security.sandbox.utility.level", 0);
+EP
+        rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
+        unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+        export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
+        setsid nohup "$FF" -profile "$PROFILE" -no-remote --new-instance \
+            "https://www.yfsp.tv/play/zImbBGABDR2" \
+            < /dev/null >> "$LOG" 2>&1 &
+        PHASE2_PID=$!
+        disown
+        echo "🚀 Firefox 已启动（PID=$PHASE2_PID），dump 到 $DUMP_FILE"
+        # 监控
+        LAST_SIZE=0
+        STALL_COUNT=0
+        while kill -0 "$PHASE2_PID" 2>/dev/null; do
+            sleep 10
+            if [ -f "$DUMP_FILE" ]; then
+                SIZE=$(stat -c%s "$DUMP_FILE")
+                if [ "$SIZE" -gt "$LAST_SIZE" ]; then
+                    echo "  ✅ Dump: $(numfmt --to=iec $SIZE)"
+                    LAST_SIZE=$SIZE
+                    STALL_COUNT=0
+                else
+                    STALL_COUNT=$((STALL_COUNT+1))
+                    if [ "$STALL_COUNT" -ge 6 ]; then
+                        echo "  📦 60s 无增长，停止"
+                        break
+                    fi
+                fi
+            fi
+        done
+        # Post-processing
+        OUT="${DUMP_FILE%.h264}.mp4"
+        echo ""
+        echo "📦 转 mp4: $OUT"
+        ffmpeg -y -framerate 15 -i "$DUMP_FILE" -c:v copy -movflags +faststart "$OUT" 2>&1 | tail -3
+        ls -lh "$OUT"
+        exit 0
+    fi
+fi
+
+# Phase 1 真实启动
+if [ "$PROFILE_NEW" = "1" ] || [ "$CF_COUNT" = "0" ]; then
+    echo "📦 新 profile: $PROFILE"
     rm -rf "$PROFILE"
     mkdir -p "$PROFILE"
+fi
 
-    # user.js：只写必要的，**不关 sandbox，不改 UA**
-    cat > "$PROFILE/user.js" << 'PJ'
-user_pref("network.proxy.type", 5);                   // 走 GNOME 系统代理（Aurora SOCKS5）
+# **关键 user.js — 严禁这两条配置**
+cat > "$PROFILE/user.js" << 'PJ'
+// === Phase 1: sandbox 默认 + Firefox 真实 UA ===
+// 严禁 general.useragent.override！会让 CF 把 Firefox 看作 bot
+// 严禁 security.sandbox.*.level = 0！会让 CF Turnstile 拒绝发 cookie
+user_pref("network.proxy.type", 5);                       // 走 GNOME 系统代理（Aurora SOCKS5）
 user_pref("media.autoplay.default", 0);
-user_pref("browser.sessionstore.resume_from_crash", false);  // 崩了不弹恢复对话框
-user_pref("browser.sessionstore.max_resumed_crashes", 0);    // 不自动恢复崩溃 session
-user_pref("browser.startup.page", 3);                        // 恢复上次的标签页
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
+user_pref("browser.startup.page", 3);
 user_pref("dom.webdriver.enabled", false);
 user_pref("privacy.resistFingerprinting", false);
 PJ
 
-    export DISPLAY=:1
-    export XAUTHORITY=/run/user/1000/gdm/Xauthority
-    unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY MOZ_STREAM_DUMP_PATH
+# 清残留锁
+rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY MOZ_STREAM_DUMP_PATH
 
-    echo "📦 新 profile: $PROFILE"
-    echo "🚀 启动 Firefox（sandbox 开启）..."
-    echo ""
+echo "🚀 启动 Firefox（Phase 1：sandbox 正常）..."
+setsid nohup "$FF" \
+    -profile "$PROFILE" \
+    -no-remote --new-instance \
+    "https://www.yfsp.tv/play/zImbBGABDR2" \
+    < /dev/null > "$LOG" 2>&1 &
+PHASE1_PID=$!
+disown
 
-    setsid nohup "$FF" \
-        -profile "$PROFILE" \
-        -no-remote --new-instance \
-        "https://www.yfsp.tv/play/zImbBGABDR2" \
-        < /dev/null > "$LOG" 2>&1 &
-    FF_PID=$!
-    disown
+# 拉窗口到前台
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1.5
+    WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+        xdotool search "Just a moment" 2>/dev/null | head -1)
+    [ -z "$WID" ] && WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+        xdotool search --classname "firefox-default" 2>/dev/null | head -1)
+    [ -n "$WID" ] && {
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowsize "$WID" 1280 800 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowmove "$WID" 200 100 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowactivate "$WID" 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowraise "$WID" 2>/dev/null
+        break
+    }
+done
 
-    # 拉窗口到前台
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 1.5
-        WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-            xdotool search "Just a moment" 2>/dev/null | head -1)
-        [ -z "$WID" ] && WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-            xdotool search --classname "firefox-default" 2>/dev/null | head -1)
-        if [ -n "$WID" ]; then
-            echo "🪟 找到窗口 WID=$WID"
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowsize "$WID" 1280 800 &>/dev/null
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowmove "$WID" 200 100 &>/dev/null
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowactivate "$WID" windowraise "$WID" &>/dev/null
-            break
-        fi
-    done
+echo ""
+echo "┌──────────────────────────────────────────────────────────┐"
+echo "│  👆  请手动通过 CF 人机验证                              │"
+echo "│                                                          │"
+echo "│  Firefox 通过验证后**会自动崩溃**（patched build WebGL   │"
+echo "│  限制），崩溃后 cookie 已经落盘。脚本会自动检测。        │"
+echo "│                                                          │"
+echo "│  静默等待中，无须任何操作...                              │"
+echo "└──────────────────────────────────────────────────────────┘"
+echo ""
 
-    echo ""
-    echo "┌────────────────────────────────────────────────────┐"
-    echo "│  👆  请在 Firefox 窗口中手动通过 CF 人机验证       │"
-    echo "│                                                   │"
-    echo "│  通过后 Firefox 很可能会崩溃重启 / 自动恢复，     │"
-    echo "│  脚本会自动检测并进入 Phase 2。                    │"
-    echo "│                                                   │"
-    echo "│  ⏳ 正在等待 Firefox 进程结束..."                   │
-    echo "└────────────────────────────────────────────────────┘"
-    echo ""
-
-    # 轮询等 Firefox 主进程退出
-    while kill -0 "$FF_PID" 2>/dev/null; do
-        sleep 5
-    done
-    echo "  ✅ Firefox 进程已结束"
-}
-
-# ============================================================
-# Phase 1.5 — 检测 cookie + 杀自动恢复的 Firefox
-# ============================================================
-check_cookie() {
-    echo ""
-    echo "  🔍 检测 cf_clearance cookie..."
-
-    # 清可能残留的锁
-    rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
-
-    # 如果有 cookies.sqlite，读它
-    if [ -f "$PROFILE/cookies.sqlite" ]; then
-        CF_COUNT=$(sqlite3 "$PROFILE/cookies.sqlite" \
-            "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance'" 2>/dev/null || echo "0")
-        if [ "$CF_COUNT" -gt 0 ]; then
-            echo "  ✅ cf_clearance 已存在（$CF_COUNT 个）"
-            return 0
-        fi
+# 静默等待 Phase 1 Firefox 退出（30 分钟超时）
+WAIT_TIMEOUT=1800
+WAIT_START=$(date +%s)
+while kill -0 "$PHASE1_PID" 2>/dev/null; do
+    ELAPSED=$(($(date +%s) - WAIT_START))
+    if [ $ELAPSED -gt $WAIT_TIMEOUT ]; then
+        echo "⏰ 等待超时（$WAIT_TIMEOUT 秒），强制终止 Firefox"
+        kill -9 "$PHASE1_PID" 2>/dev/null
+        break
     fi
-    echo "  ❌ 未检测到 cf_clearance cookie"
-    return 1
-}
+    sleep 10
+done
 
-kill_auto_restored_firefox() {
-    # Firefox 崩后可能自动重启（session restore），杀掉
-    for PID in $(ps -ef | grep -v grep | grep "yfsp-dump-profile" | awk '{print $2}'); do
-        kill -9 "$PID" 2>/dev/null && echo "  🔪 杀掉自动恢复的 Firefox PID=$PID"
-    done
-    sleep 2
-    rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
-}
-
-# ============================================================
-# Phase 2 — StreamDumper 抓取（sandbox 关闭）
-# ============================================================
-phase2() {
-    echo ""
-    echo "╔══════════════════════════════════════════════════════╗"
-    echo "║    Phase 2 — StreamDumper 抓取（sandbox 关闭）     ║"
-    echo "╚══════════════════════════════════════════════════════╝"
-    echo ""
-
-    # 注：直接修改 profile 的 prefs.js，追加 sandbox 关闭配置
-    # 这只在 Phase 2 才执行，不影响 Phase 1 的 CF 验证
-    PJS="$PROFILE/prefs.js"
-    if [ -f "$PJS" ]; then
-        # 删掉之前可能残留的错误配置
-        sed -i '/user_pref("security\.sandbox/d' "$PJS" 2>/dev/null || true
+# 杀掉可能自动恢复的 Firefox
+for PID in $(ps -ef | grep -v grep | grep "$(basename $PROFILE)" | awk '{print $2}'); do
+    EXE=$(readlink -f /proc/$PID/exe 2>/dev/null)
+    if echo "$EXE" | grep -q "firefox-stream-fetch"; then
+        kill -9 "$PID" 2>/dev/null
     fi
-    cat >> "$PJS" <<'EP'
+done
+sleep 2
+rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
+
+# 检测 cookie
+CF_COUNT=$(sqlite3 "$PROFILE/cookies.sqlite" \
+    "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance'" 2>/dev/null || echo "0")
+if [ "$CF_COUNT" -eq 0 ]; then
+    echo ""
+    echo "❌ 未检测到 cf_clearance cookie"
+    echo "   可能原因："
+    echo "   - 你没有完成 CF 验证"
+    echo "   - Firefox 崩溃时 cookie 还未落盘"
+    echo "   重新跑一次脚本即可再试。"
+    exit 1
+fi
+echo ""
+echo "✅ Phase 1 完成 — cf_clearance cookie 已落盘（$CF_COUNT 个）"
+echo ""
+
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  Phase 2 — StreamDumper 抓取                                        ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+echo "╔════════════════════════════════════════════════════════════╗"
+echo "║  Phase 2 — StreamDumper 抓取（sandbox 关闭）              ║"
+echo "╚════════════════════════════════════════════════════════════╝"
+echo ""
+
+# 关 sandbox，让 StreamDumper 能写文件
+PJS="$PROFILE/prefs.js"
+if [ -f "$PJS" ]; then
+    sed -i '/user_pref("security\.sandbox/d' "$PJS" 2>/dev/null || true
+fi
+cat >> "$PJS" <<'EP'
 // === Phase 2: 关 sandbox 让 StreamDumper 写 /tmp/ ===
 user_pref("security.sandbox.content.level", 0);
 user_pref("security.sandbox.gmp.level", 0);
@@ -156,119 +230,85 @@ user_pref("security.sandbox.socket.level", 0);
 user_pref("security.sandbox.utility.level", 0);
 EP
 
-    export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
-    export DISPLAY=:1
-    export XAUTHORITY=/run/user/1000/gdm/Xauthority
+export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
-    echo "📦 Dump: $DUMP_FILE"
-    echo "🚀 重启 Firefox（sandbox 关闭，StreamDumper 就绪）..."
-    echo ""
+echo "📦 Dump: $DUMP_FILE"
+echo "🚀 重启 Firefox（Phase 2：sandbox 关闭）..."
+setsid nohup "$FF" \
+    -profile "$PROFILE" \
+    -no-remote --new-instance \
+    "https://www.yfsp.tv/play/zImbBGABDR2" \
+    < /dev/null >> "$LOG" 2>&1 &
+PHASE2_PID=$!
+disown
 
-    setsid nohup "$FF" \
-        -profile "$PROFILE" \
-        -no-remote --new-instance \
-        "https://www.yfsp.tv/play/zImbBGABDR2" \
-        < /dev/null > "$LOG" 2>&1 &
-    FF_PID=$!
-    disown
+# 拉窗口
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1.5
+    WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+        xdotool search --classname "firefox-default" 2>/dev/null | head -1)
+    [ -n "$WID" ] && {
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowsize "$WID" 1280 800 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowmove "$WID" 400 150 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowactivate "$WID" 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 xdotool windowraise "$WID" 2>/dev/null
+        break
+    }
+done
 
-    # 拉窗口
-    for i in 1 2 3 4 5 6 7 8 9 10; do
-        sleep 1.5
-        WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-            xdotool search --classname "firefox-default" 2>/dev/null | head -1)
-        if [ -n "$WID" ]; then
-            echo "🪟 找到窗口 WID=$WID"
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowsize "$WID" 1280 800 &>/dev/null
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowmove "$WID" 400 150 &>/dev/null
-            XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
-                xdotool windowactivate "$WID" windowraise "$WID" &>/dev/null
-            break
-        fi
-    done
+# 监控 dump
+LAST_SIZE=0
+STALL_COUNT=0
+echo ""
+echo "  ⏳ 监控 dump（每 10 秒）..."
 
-    # 监控 dump 进度
-    echo ""
-    echo "  ⏳ 正在等待 StreamDumper 触发..."
-    LAST_SIZE=0
-    STALL_COUNT=0
-
-    while true; do
-        sleep 10
-
-        if kill -0 "$FF_PID" 2>/dev/null; then
-            : # Firefox 还活着
-        else
-            echo ""
-            echo "  ⚠️  Firefox 已退出（可能又崩了？）"
-            peek_dump
-            return 1
-        fi
-
-        if [ -f "$DUMP_FILE" ]; then
-            SIZE=$(stat -c%s "$DUMP_FILE" 2>/dev/null || echo 0)
-            if [ "$SIZE" -gt "$LAST_SIZE" ]; then
-                DELTA=$((SIZE - LAST_SIZE))
-                echo "  ✅ Dump: $(numfmt --to=iec $SIZE)  (+$(numfmt --to=iec $DELTA))"
-                LAST_SIZE=$SIZE
-                STALL_COUNT=0
-            else
-                STALL_COUNT=$((STALL_COUNT + 1))
-                echo "  ⏳ 文件 ${STALL_COUNT}次检测无增长（视频可能播完）"
-                if [ "$STALL_COUNT" -ge 12 ]; then
-                    echo "  📦 120s 无增长，停止监控"
-                    break
-                fi
-            fi
-        else
-            echo "  ⏳ 暂无 dump（等待视频加载 + StreamDumper 触发）"
-        fi
-    done
-    return 0
-}
-
-# ============================================================
-# 善后 — 检查 dump 文件
-# ============================================================
-peek_dump() {
-    echo ""
-    echo "========================================"
-    echo "  最终结果"
-    echo "========================================"
+while kill -0 "$PHASE2_PID" 2>/dev/null; do
+    sleep 10
     if [ -f "$DUMP_FILE" ]; then
-        echo "  📁 Dump: $(ls -lh "$DUMP_FILE" | awk '{print $5}')"
-        echo "  路径: $DUMP_FILE"
-        FPS=$(ffprobe -v error -count_frames -select_streams v:0 \
-            -show_entries stream=nb_read_frames -of csv=p=0 "$DUMP_FILE" 2>/dev/null || echo 'N/A')
-        echo "  帧数: $FPS"
-        echo ""
-        echo "  💡 播放: ffplay -f h264 -i '$DUMP_FILE'"
-        echo "  转 mp4: ffmpeg -framerate 25 -i '$DUMP_FILE' -c copy output.mp4"
+        SIZE=$(stat -c%s "$DUMP_FILE")
+        if [ "$SIZE" -gt "$LAST_SIZE" ]; then
+            DELTA=$((SIZE - LAST_SIZE))
+            echo "  ✅ $(numfmt --to=iec $SIZE)  (+$(numfmt --to=iec $DELTA))"
+            LAST_SIZE=$SIZE
+            STALL_COUNT=0
+        else
+            STALL_COUNT=$((STALL_COUNT+1))
+            if [ "$STALL_COUNT" -ge 12 ]; then
+                echo "  📦 120s 无增长，停止（视频可能已播完）"
+                kill -15 "$PHASE2_PID" 2>/dev/null
+                break
+            fi
+        fi
     else
-        echo "  ❌ 无 dump 文件"
-        echo "  日志: $LOG"
-        grep "StreamDumper\|dump" "$LOG" | head -5
+        echo "  ⏳ 暂无 dump（等待视频加载）"
     fi
-}
+done
 
-# ============================================================
-# 主流程
-# ============================================================
-phase1
-kill_auto_restored_firefox
-
-if check_cookie; then
-    phase2
-    peek_dump
+# ╔══════════════════════════════════════════════════════════════════════╗
+# ║  后处理 — mp4 封装                                                  ║
+# ╚══════════════════════════════════════════════════════════════════════╝
+echo ""
+echo "════════════════════════════════════════════════════════════"
+echo "  最终结果"
+echo "════════════════════════════════════════════════════════════"
+if [ -f "$DUMP_FILE" ]; then
+    OUT="${DUMP_FILE%.h264}.mp4"
+    echo ""
+    echo "📦 H.264 dump: $(ls -lh $DUMP_FILE | awk '{print $5}')"
+    echo "📦 转封装 mp4:"
+    ffmpeg -y -framerate 15 -i "$DUMP_FILE" -c:v copy -movflags +faststart "$OUT" 2>&1 | tail -3
+    echo ""
+    echo "✅ mp4: $OUT"
+    ls -lh "$OUT"
+    echo ""
+    ffprobe -v error -show_format -show_streams "$OUT" 2>&1 \
+        | grep -E "codec_name|profile|width|height|duration=|nb_frames" | head -10
+    echo ""
+    echo "💡 播放: ffplay '$OUT'"
 else
+    echo "❌ 无 dump 文件"
+    echo "日志: $LOG"
     echo ""
-    echo "❌ 未检测到 cf_clearance cookie。"
-    echo "  可能原因："
-    echo "  - CF 验证未通过"
-    echo "  - Firefox 非正常退出（崩溃时 cookie 未落盘）"
-    echo ""
-    echo "  重新运行脚本即可再试一次。"
-    exit 1
+    grep "StreamDumper" "$LOG" | head -5
 fi
