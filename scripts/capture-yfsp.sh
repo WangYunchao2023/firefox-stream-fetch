@@ -7,6 +7,27 @@ PROFILE="/tmp/firefox-yfsp-persistent-profile"   # ← 固定名称，不删！
 DUMP_DIR="/tmp/moz_stream_dumps"
 mkdir -p "$DUMP_DIR"
 
+# === 【每次跑都强制同步】代理 prefs 进 prefs.js ===
+# user.js 里写了 network.proxy.*，但只在 profile 不存在时执行；
+# 已有 profile 时，旧 prefs.js 里还残留上次错的 http://19090 proxy。
+# 这里补丁 prefs.js 让 SOCKS5 必定生效。
+if [ -d "$PROFILE" ]; then
+    PJS="$PROFILE/prefs.js"
+    if [ -f "$PJS" ]; then
+        # 先干掉旧的 http_proxy 行
+        sed -i '/user_pref("network\.proxy\.http"/d; /user_pref("network\.proxy\.ssl"/d; /user_pref("network\.proxy\.type"/d; /user_pref("network\.proxy\.socks"/d; /user_pref("network\.proxy\.socks_port"/d; /user_pref("network\.proxy\.socks_version"/d; /user_pref("network\.proxy\.socks_remote_dns"/d; /user_pref("network\.proxy\.no_proxies_on"/d' "$PJS" 2>/dev/null || true
+        cat >> "$PJS" <<'EP'
+// === firefox-stream-fetch: 强制走 aurora SOCKS5 (7/14 修) ===
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.socks", "127.0.0.1");
+user_pref("network.proxy.socks_port", 29290);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
+EP
+    fi
+fi
+
 # === 只在第一次创建 profile（保留 CF cookie）===
 if [ ! -d "$PROFILE" ]; then
     mkdir -p "$PROFILE"
@@ -46,6 +67,17 @@ user_pref("media.peerconnection.ice.no_host", true);
 // === Navigator 信息补全（让指纹更接近正常 Chrome）===
 user_pref("dom.webdriver.enabled", false);
 user_pref("privacy.resistFingerprinting", false);
+
+// === 代理：aurora-slim 的 SOCKS5 (29290) 才能走 HTTPS ===
+//   19090 是 HTTP forward proxy，不支持 CONNECT，HTTPS 走它会 405
+//   18090 也是 HTTP-only（会返回 301 redirect 假冒隧道）
+//   SOCKS5 + remote DNS 才能让 CF / Turnstile 拿到干净的出口 IP
+user_pref("network.proxy.type", 1);                        // 0=direct, 1=manual, 4=SOCKS
+user_pref("network.proxy.socks", "127.0.0.1");
+user_pref("network.proxy.socks_port", 29290);
+user_pref("network.proxy.socks_version", 5);
+user_pref("network.proxy.socks_remote_dns", true);
+user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
 PJ
     echo "📁 新 profile 创建于 $PROFILE"
     echo "   ⚠️  首次使用需要手动过 Cloudflare 人机验证"
@@ -66,17 +98,23 @@ DUMP_FILE="$DUMP_DIR/yfsp-$(date +%Y%m%d-%H%M%S).h264"
 LOG="$DUMP_DIR/yfsp.log"
 > "$LOG"
 
-# === 始终走代理 ===
+# === 代理走 user.js 里的 network.proxy.socks（见上方）===
+# 旧版误用 http://127.0.0.1:19090，那个端口是 HTTP forward proxy，
+# Firefox HTTPS 会发 CONNECT，被代理 405 Method Not Allowed。
+# 真正能走 HTTPS 的是 aurora-slim 的 SOCKS5 端口 29290（curl 实测 baidu 200 OK）。
 export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
-export http_proxy=http://127.0.0.1:19090
-export https_proxy=http://127.0.0.1:19090
+# 保留 env 变量不影响 Firefox（它不读 SOCKS5_SERVER），
+# 万一脚本里某条 curl/ffprobe 调用想用它兜底也行。
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY 2>/dev/null
+export SOCKS5_SERVER=socks5://127.0.0.1:29290
+export SOCKS_PROXY=socks5://127.0.0.1:29290
 
 setsid nohup "$FF" \
     -profile "$PROFILE" \
     -no-remote --new-instance \
-    "https://www.yfsp.tv/play/XSP8nCQJxQ9" \
+    "https://www.yfsp.tv/play/zImbBGABDR2" \
     < /dev/null > "$LOG" 2>&1 &
 FF_PID=$!
 disown
