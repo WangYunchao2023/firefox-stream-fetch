@@ -24,6 +24,11 @@ user_pref("network.proxy.socks_port", 29290);
 user_pref("network.proxy.socks_version", 5);
 user_pref("network.proxy.socks_remote_dns", true);
 user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
+// === WebGL 稳定性 ===
+user_pref("webgl.out-of-process", false);
+user_pref("webgl.software-renderer.enable", true);
+user_pref("webgl.disable-fail-if-major-performance-caveat", true);
+user_pref("webgl.force-layers-readback", false);
 EP
     fi
 fi
@@ -78,6 +83,20 @@ user_pref("network.proxy.socks_port", 29290);
 user_pref("network.proxy.socks_version", 5);
 user_pref("network.proxy.socks_remote_dns", true);
 user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1, ::1");
+
+// === WebGL 稳定性（避免 CF Turnstile "context lost" 死循环）===
+// 关掉 GPU process / sandbox 让 WebGL 走主进程，少一次 IPC
+user_pref("gfx.webrender.all-angles", true);
+user_pref("webgl.disable-fail-if-major-performance-caveat", true);
+user_pref("webgl.force-layers-readback", false);
+// 关掉 GL 沙箱的 reset 检测（避免「context lost」误报）
+user_pref("webgl.enable-image-texture", true);
+// 允许 WebGL 在 software renderer 上跑（CF Turnstile 只需 canvas 着色器）
+user_pref("webgl.software-renderer.enable", true);
+// 不让 WebGL 跨进程（avoid GPU process crash → context lost）
+user_pref("webgl.out-of-process", false);
+// 抑制 deprecated 警告刷屏
+user_pref("dom.webgl.disabled-extensions.warn-on-use", false);
 PJ
     echo "📁 新 profile 创建于 $PROFILE"
     echo "   ⚠️  首次使用需要手动过 Cloudflare 人机验证"
@@ -122,6 +141,34 @@ disown
 echo "Firefox PID: $FF_PID"
 echo "Dump: $DUMP_FILE"
 echo "Log:  $LOG"
+
+# === 拉窗口到前台 ===
+# 上次发现窗口被置为 1x1 + (0,0) 完全看不见，
+# 因为 setsid 脱壳后 WM 没拿到 geometry。
+# 轮询 15s 等窗口起来，再 move+resize+activate。
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1.5
+    # --name 默认是子串匹配，不是 regex。
+    # 联合 title / classname 一起匹配（「firefox-default」是 className）。
+    WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+        xdotool search "Just a moment" 2>/dev/null \
+        | grep -v '^$' | head -1)
+    [ -z "$WID" ] && WID=$(XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+        xdotool search --classname "firefox-default" 2>/dev/null \
+        | grep -v '^$' | head -1)
+    if [ -n "$WID" ]; then
+        echo "🪟 找到 Firefox 窗口 WID=$WID（尝试 $i）"
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+            xdotool windowsize "$WID" 1280 800 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+            xdotool windowmove "$WID" 200 100 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+            xdotool windowactivate "$WID" 2>/dev/null
+        XAUTHORITY=/run/user/1000/gdm/Xauthority DISPLAY=:1 \
+            xdotool windowraise "$WID" 2>/dev/null
+        break
+    fi
+done
 echo ""
 
 # === 检查 CF 状态 ===
