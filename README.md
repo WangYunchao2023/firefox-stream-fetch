@@ -43,11 +43,35 @@ firefox-stream-fetch/
 - [x] 定位 hook 点（MediaFormatReader::HandleDemuxedSamples + OnVideoDemuxCompleted 双 hook）
 - [x] 写 patch
 - [x] 编译 + 本地 mp4 验证通过（913 帧 36.5s mp4 dump，可 ffplay/转封装）
+- [x] **AAC 音频 dump 验证通过（10s 测试流 → 音视频双轨 mp4）**
 - [ ] Widevine L3 真实内容验证（需手动播放确认 hook 对 EME 路径同样工作）
 - [ ] 编译 + 测试
 
 
 ## 版本记录
+
+### v2.1.0 (2026-07-15)
+
+**新增：解密后 AAC 音频 dump（与视频同时写出）**
+
+改动：
+- `dom/media/MediaFormatReader.cpp`：StreamDumper 在 `HandleDemuxedSamples` 里按 TrackType 分支
+  - `kVideoTrack` → 现有路径（H.264/HEVC/AV1 裸码流）
+  - `kAudioTrack` → 新 `DumpAudio()`，用 Mozilla 自带的 `ADTS::ConvertSample` 把 AAC 包成 ADTS 帧
+- 音频输出路径：`MOZ_STREAM_DUMP_PATH` 去掉视频扩展名后加 `.aac`
+  - `MOZ_STREAM_DUMP_PATH=/tmp/foo.h264` → 视频 `/tmp/foo.h264` + 音频 `/tmp/foo.aac`
+  - 默认（无环境变量）→ `/tmp/moz_stream.h264` + `/tmp/moz_stream.aac`
+- 合流：`ffmpeg -i video.h264 -i audio.aac -c copy out.mp4`
+
+新脚本：
+- `scripts/verify-audio.sh` — end-to-end 验证（生成测试 mp4、起 firefox、探测 .h264/.aac 双 dump、ffprobe 识别、ffmpeg 合流、断言双轨）
+
+验证（10s 合成的 H.264 + AAC 测试流）：
+- `ffprobe audio.aac`：AAC LC, 44100 Hz, mono, 86 kb/s, 10.16s
+- `ffprobe merged.mp4`：10.03s, Stream #0:0 Video H.264, Stream #0:1 Audio AAC
+
+Patches：
+- `patches/0004-add-audio-dump.patch` — v2.1.0 DumpAudio + 路径 trim
 
 ### v2.0.0 (2026-07-14)
 
