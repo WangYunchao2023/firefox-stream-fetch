@@ -1,0 +1,134 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] dump: capture decrypted AAC audio samples alongside video
+
+Extend StreamDumper to dump AAC audio samples (decrypted, still compressed)
+to a sibling .aac file with ADTS framing, so users get both tracks when
+remuxing:
+
+  ffmpeg -i video.h264 -i audio.aac -c copy out.mp4
+
+Hook point: same HandleDemuxedSamples already used for video (no separate
+path needed). The audio track hits a new DumpAudio() that:
+
+  1. Picks the source TrackInfo: caller-supplied (decoder's current info)
+     falls back to aSample->mTrackInfo (MP4Demuxer doesn't set this).
+  2. Resolves AAC profile + sample rate → ADTS frequency index via
+     Mozilla's ADTS::GetFrequencyIndex().
+  3. Clones the sample so ADTS::ConvertSample's 7-byte header prepend
+     doesn't mutate the demuxed sample the decoder still needs.
+  4. Writes ADTS-framed AAC frames to <base>.aac, where <base> is
+     MOZ_STREAM_DUMP_PATH with .h264/.h265/.av1/.bin stripped.
+
+Verified on a synthesized 10s H.264+AAC test pattern: video 320x240,
+audio AAC LC 44.1kHz mono, ffmpeg -c copy produces a 10.03s mp4 with
+both streams present.
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index d4aba22cf7..1d1370679f 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -13,6 +13,7 @@
+ #include <map>
+ #include <queue>
+ 
++#include "Adts.h"
+ #include "AllocationPolicy.h"
+ #include "AnnexB.h"
+ #ifdef MOZ_AV1
+@@ -80,6 +81,11 @@ class StreamDumper {
+     }
+     ++sCallCount;
+     if (!aSample) return;
++
++    if (aTrack == mozilla::TrackInfo::kAudioTrack) {
++      DumpAudio(aSample, aInfo);
++      return;
++    }
+     if (aTrack != mozilla::TrackInfo::kVideoTrack) return;
+ 
+     // Source TrackInfo: caller-supplied is most reliable (decoder's current info).
+@@ -307,6 +313,85 @@ class StreamDumper {
+       }
+     }
+   }
++
++ private:
++  // DumpAudio: write AAC audio samples (decrypted, still compressed) to a
++  // separate file as raw ADTS-wrapped AAC frames. Uses the same MOZ_STREAM_DUMP_PATH
++  // prefix as the video file but with .aac suffix, e.g. /tmp/foo.h264 + /tmp/foo.aac.
++  // Concatenated ADTS frames are decodable by ffmpeg/ffplay directly, and can be
++  // remuxed with the video file using:
++  //   ffmpeg -i video.h264 -i audio.aac -c copy out.mp4
++  static void DumpAudio(mozilla::MediaRawData* aSample,
++                        const mozilla::TrackInfo* aInfo) {
++    // Source TrackInfo: caller-supplied is most reliable (decoder's current info).
++    // Fall back to sample->mTrackInfo (HLS demuxer sets this; MP4Demuxer does not).
++    const mozilla::TrackInfo* ti = aInfo;
++    if (!ti && aSample->mTrackInfo) {
++      ti = aSample->mTrackInfo->operator->();
++    }
++    if (!ti) return;
++    auto* ai = ti->GetAsAudioInfo();
++    if (!ai) return;
++
++    static FILE* sAudioFile = nullptr;
++    if (!sAudioFile) {
++      const char* env = std::getenv("MOZ_STREAM_DUMP_PATH");
++      char path[512];
++      if (env && *env) {
++        // Strip known video extensions so audio sibling lands at <base>.aac
++        // rather than <base>.h264.aac (ugly and breaks -i auto-pairing).
++        const char* dot = std::strrchr(env, '.');
++        if (dot && (std::strcmp(dot, ".h264") == 0 ||
++                    std::strcmp(dot, ".h265") == 0 ||
++                    std::strcmp(dot, ".av1") == 0 ||
++                    std::strcmp(dot, ".bin") == 0)) {
++          std::snprintf(path, sizeof(path), "%.*s.aac",
++                        (int)(dot - env), env);
++        } else {
++          std::snprintf(path, sizeof(path), "%s.aac", env);
++        }
++      } else {
++        std::snprintf(path, sizeof(path), "/tmp/moz_stream.aac");
++      }
++      sAudioFile = std::fopen(path, "wb");
++      if (!sAudioFile) {
++        std::fprintf(stderr,
++                     "[StreamDumper] audio dump: failed to open %s (errno=%d %s)\n",
++                     path, errno, std::strerror(errno));
++        return;
++      }
++      std::fprintf(stderr,
++                   "[StreamDumper] writing AAC audio to %s "
++                   "(rate=%u ch=%u profile=%u mime=%s)\n",
++                   path, ai->mRate, ai->mChannels, ai->mProfile,
++                   ai->mMimeType.get());
++    }
++
++    auto freqIdx = mozilla::ADTS::GetFrequencyIndex(ai->mRate);
++    if (freqIdx.isErr()) {
++      std::fprintf(stderr,
++                   "[StreamDumper] audio dump: unsupported sample rate %u\n",
++                   ai->mRate);
++      return;
++    }
++    // MPEG-4 Audio Object Type minus 1; clamp to AAC LC (=2) for unknown.
++    uint8_t profile =
++        (ai->mProfile < 1 || ai->mProfile > 4) ? 2 : ai->mProfile;
++
++    // Clone sample so ConvertSample's prepend doesn't mutate the demuxed
++    // sample that the decoder still needs.
++    RefPtr<mozilla::MediaRawData> clone = aSample->Clone();
++    if (!clone) return;
++
++    if (!mozilla::ADTS::ConvertSample(ai->mChannels, freqIdx.unwrap(),
++                                      profile, clone)) {
++      std::fprintf(stderr,
++                   "[StreamDumper] audio dump: ADTS::ConvertSample failed\n");
++      return;
++    }
++    std::fwrite(clone->Data(), 1, clone->Size(), sAudioFile);
++    std::fflush(sAudioFile);
++  }
+ };
+ 
+ namespace mozilla {
