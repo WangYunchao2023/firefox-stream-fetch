@@ -31,6 +31,8 @@ LOG="$DUMP_DIR/yfsp-$TS.log"
 
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
+export MOZ_ENABLE_WAYLAND=0
+export GDK_BACKEND=x11
 
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Phase 1 — 拿 CF cookie                                            ║

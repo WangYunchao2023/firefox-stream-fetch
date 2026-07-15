@@ -107,6 +107,8 @@ LOG="$OUTPUT_DIR/${PROFILE_NAME}-${TS}.log"
 
 export DISPLAY=:1
 export XAUTHORITY=/run/user/1000/gdm/Xauthority
+export MOZ_ENABLE_WAYLAND=0
+export GDK_BACKEND=x11
 PHASE1_TIMEOUT=1800
 EPISODE_INDEX=1
 PHASE1_START="${URL:-about:newtab}"
