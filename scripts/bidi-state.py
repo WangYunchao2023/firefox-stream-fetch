@@ -31,20 +31,92 @@ except ImportError:
     sys.exit(4)
 
 
-QUERY_FN = """function() {
-  const v = document.querySelector('video');
-  if (!v) return JSON.stringify({state: 'no-video'});
-  let bufferedEnd = 0;
-  if (v.buffered.length > 0) {
-    bufferedEnd = v.buffered.end(v.buffered.length - 1);
+def _build_query_fn(video_selector=None):
+    """Build JS function to find and query video element.
+    video_selector: optional CSS selector string, or 'auto' for smart detection"""
+    if video_selector and video_selector != 'auto':
+        # Custom selector provided
+        selector_js = f"document.querySelector('{video_selector}')"
+    elif video_selector == 'auto' or video_selector is None:
+        # Smart detection: try multiple strategies
+        selector_js = """
+(function() {
+  // Strategy 1: Try common player selectors
+  const selectors = [
+    '#dplayer video',
+    '.dplayer-video video',
+    '.artplayer video',
+    '#player video',
+    '.player video',
+    '[id*="player"] video',
+    '[class*="player"] video',
+  ];
+  for (const sel of selectors) {
+    const v = document.querySelector(sel);
+    if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
   }
+  
+  // Strategy 2: Check iframes (same-origin only)
+  const iframes = document.querySelectorAll('iframe');
+  for (const iframe of iframes) {
+    try {
+      const doc = iframe.contentDocument || iframe.contentWindow.document;
+      if (doc) {
+        const v = doc.querySelector('video');
+        if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
+      }
+    } catch (e) {}
+  }
+  
+  // Strategy 3: Check shadow DOM
+  function findInShadow(root) {
+    const v = root.querySelector('video');
+    if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) {
+        const found = findInShadow(el.shadowRoot);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+  const shadowV = findInShadow(document);
+  if (shadowV) return shadowV;
+  
+  // Strategy 4: Find video with longest duration > 2s
+  const videos = document.querySelectorAll('video');
+  let best = null;
+  let bestDur = 0;
+  for (const v of videos) {
+    if (v.duration && isFinite(v.duration) && v.duration > bestDur) {
+      bestDur = v.duration;
+      best = v;
+    }
+  }
+  if (best && bestDur > 2) return best;
+  
+  // Fallback: first video
+  return document.querySelector('video');
+})()
+"""
+    else:
+        # Fallback: first video
+        selector_js = "document.querySelector('video')"
+    
+    return f"""function() {{
+  const v = {selector_js};
+  if (!v) return JSON.stringify({{state: 'no-video', url: location.href, visibility: document.visibilityState}});
+  let bufferedEnd = 0;
+  if (v.buffered.length > 0) {{
+    bufferedEnd = v.buffered.end(v.buffered.length - 1);
+  }}
   const dur = (isFinite(v.duration) && !isNaN(v.duration)) ? v.duration : null;
   let state = 'unknown';
   if (v.ended) state = 'ended';
   else if (v.paused) state = 'paused';
   else if (v.readyState < 3) state = 'buffering';
   else state = 'playing';
-  return JSON.stringify({
+  return JSON.stringify({{
     state: state,
     paused: v.paused,
     ended: v.ended,
@@ -60,11 +132,73 @@ QUERY_FN = """function() {
     videoHeight: v.videoHeight,
     visibility: document.visibilityState,
     url: location.href,
-  });
-}"""
+  }});
+}}"""
 
 SEEK_FN_TPL = """function() {
-  const v = document.querySelector('video');
+  // Smart video detection (same as query)
+  const selectors = [
+    '#dplayer video',
+    '.dplayer-video video',
+    '.artplayer video',
+    '#player video',
+    '.player video',
+    '[id*=\"player\"] video',
+    '[class*=\"player\"] video',
+  ];
+  let v = null;
+  for (const sel of selectors) {
+    const candidate = document.querySelector(sel);
+    if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) {
+      v = candidate;
+      break;
+    }
+  }
+  if (!v) {
+    // Check iframes
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      try {
+        const doc = iframe.contentDocument || iframe.contentWindow.document;
+        if (doc) {
+          const candidate = doc.querySelector('video');
+          if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) {
+            v = candidate;
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+  }
+  if (!v) {
+    // Check shadow DOM
+    function findInShadow(root) {
+      const candidate = root.querySelector('video');
+      if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) return candidate;
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) {
+          const found = findInShadow(el.shadowRoot);
+          if (found) return found;
+        }
+      }
+      return null;
+    }
+    v = findInShadow(document);
+  }
+  if (!v) {
+    // Find video with longest duration > 2s
+    const videos = document.querySelectorAll('video');
+    let best = null;
+    let bestDur = 0;
+    for (const candidate of videos) {
+      if (candidate.duration && isFinite(candidate.duration) && candidate.duration > bestDur) {
+        bestDur = candidate.duration;
+        best = candidate;
+      }
+    }
+    if (best && bestDur > 2) v = best;
+  }
+  if (!v) v = document.querySelector('video'); // fallback
   if (!v) return JSON.stringify({err: 'no-video'});
   v.currentTime = %s;
   return JSON.stringify({ok: true, newTime: v.currentTime});
@@ -145,12 +279,12 @@ class BidiSession:
             return None
         return walk(contexts[0]) if contexts else None
 
-    def query(self, url_pattern=None):
+    def query(self, url_pattern=None, video_selector=None):
         ctx = self.find_context(url_pattern)
         if not ctx:
             return {"err": "no matching context", "url_pattern": url_pattern}
         r = self._call("script.callFunction", {
-            "functionDeclaration": QUERY_FN,
+            "functionDeclaration": _build_query_fn(video_selector),
             "target": {"context": ctx["context"]},
             "awaitPromise": False,
             "resultOwnership": "root",
@@ -158,8 +292,6 @@ class BidiSession:
         }, timeout=5)
         if not r or r.get("type") != "success":
             return {"err": "callFunction failed", "resp": r}
-        # firefox BiDi 返回: result.result.{type, value}
-        # 我返回的是 JSON 字符串，type=string, value='...'
         outer_result = r.get("result", {})
         inner = outer_result.get("result", {})
         val = inner.get("value")
@@ -171,7 +303,6 @@ class BidiSession:
                 except Exception as e:
                     return {"err": f"value not JSON: {e}", "raw": val}
             else:
-                # value 已经是 object 类型
                 return val
         return {"err": "no value in result", "raw_outer": outer_result}
 
@@ -305,9 +436,9 @@ def _dispatch(cmd_obj, sess):
     elif cmd == "ping":
         return {"ok": True}
     elif cmd == "query":
-        return sess.query(cmd_obj.get("url_pattern"))
+        return sess.query(cmd_obj.get("url_pattern"), cmd_obj.get("video_selector"))
     elif cmd == "seek":
-        return sess.seek(cmd_obj.get("seconds"), cmd_obj.get("url_pattern"))
+        return sess.seek(cmd_obj.get("seconds"), cmd_obj.get("url_pattern"), cmd_obj.get("video_selector"))
     else:
         return {"err": f"unknown cmd: {cmd}"}
 
