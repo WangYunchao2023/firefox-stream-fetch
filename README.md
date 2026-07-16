@@ -50,6 +50,27 @@ firefox-stream-fetch/
 
 ## 版本记录
 
+### v2.2.0 (2026-07-16)
+
+**修复：Phase 1 → Phase 2 真正能自动切换（CF 反检测）**
+
+问题：
+- `capture-generic.sh` Phase 1 启动时加了 `-remote-debugging-port` 和 BiDi 轮询检测 video state
+- CF Turnstile 会检测 devtools-protocol 端口作为 bot 信号 → yfsp.tv 等反复弹人机验证
+- BiDi 在 cross-origin iframe 场景下也读不到 video state
+
+修复：
+- `scripts/capture-generic.sh` Phase 1 去掉 `-remote-debugging-port` 和 BiDi 检测
+- 改用纯 X11 窗口标题检测（与稳定的 `capture-yfsp.sh` 一致）：`Just a moment...` → 视频页面标题 → 触发切换
+- `get_firefox_wid` 优先匹配 "Nightly" 标签页窗口，避免选到 URL 栏等没标题的子窗口
+- `bidi-state.py` `no-video` 状态也返回 `url` 字段（可跳用补点）
+
+实战验证：
+- yfsp.tv `https://www.yfsp.tv/watch?v=ztgsSWh5mPZEhhazLjYUG6`
+- 18s 过 CF → Phase 1 → Phase 2 自动切换
+- 产出 h264 19.8MB + aac 415KB → mux 成 2:21 mp4 (320x240 H.264 + AAC stereo)
+- 抽帧确认是 "Linya bilibili" vlog 真实内容
+
 ### v2.1.0 (2026-07-15)
 
 **新增：解密后 AAC 音频 dump（与视频同时写出）**

@@ -45,7 +45,7 @@ _monitor_debug() {
 # 启动 firefox
 _monitor_start_firefox() {
     local ff_bin="$1" profile="$2" url="$3"
-    setsid nohup "$ff_bin" \
+    setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
