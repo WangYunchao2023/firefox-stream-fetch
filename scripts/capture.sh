@@ -362,6 +362,9 @@ EP
     # shellcheck disable=SC1091
     source "$SCRIPT_DIR/lib-monitor.sh"
 
+    # Phase 2 必须 export MOZ_STREAM_DUMP_PATH 给 StreamDumper（Phase 1 设为 /dev/null）
+    export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
+
     # Phase 2 URL 优先级：起始传入 > profile 中保存的 session tab
     local PHASE2_URL="${URL:-about:home}"
 
@@ -426,7 +429,11 @@ mux_to_mp4() {
             rm -f "$concat_file"; return 1; }
         rm -f "$concat_file"
     elif [ -s "$dump" ]; then
-        ffmpeg -y -framerate 15 -i "$dump" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || return 1
+        # 自动探测帧率（从 SPS VUI 或解码前几帧估算）
+        local fps
+        fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$dump" 2>/dev/null | head -1)
+        [ -z "$fps" ] && fps="25/1"
+        ffmpeg -y -fflags +genpts -r "$fps" -i "$dump" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || return 1
     fi
 
     if [ ! -f "$tmp_v" ]; then
@@ -434,13 +441,19 @@ mux_to_mp4() {
         return 1
     fi
 
-    # 合并音频
+    # 合并音频 —— 自动探测采样率/声道
     if [ -s "$audio" ]; then
-        ffmpeg -y -i "$tmp_v" -i "$audio" \
-            -c copy -map 0:v:0 -map 1:a:0 \
-            -movflags +faststart "$out" -loglevel error || {
+        local tmp_a="${out}.tmpa.m4a"
+        local ar ch
+        ar=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$audio" 2>/dev/null | head -1)
+        ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
+        [ -z "$ar" ] && ar="44100"
+        [ -z "$ch" ] && ch="2"
+        ffmpeg -y -i "$audio" -c:a copy "$tmp_a" -loglevel error || {
+            echo "  ⚠️  音频预处理失败，尝试直接合并"; ffmpeg -y -i "$tmp_v" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v" "$out"; return 1; }
+        } && ffmpeg -y -i "$tmp_v" -i "$tmp_a" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || {
             echo "  ⚠️  音频合并失败，留视频轨"; mv "$tmp_v" "$out"; return 1; }
-        rm -f "$tmp_v"
+        rm -f "$tmp_v" "$tmp_a"
     else
         mv "$tmp_v" "$out"
     fi

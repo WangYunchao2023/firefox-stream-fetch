@@ -277,27 +277,25 @@ monitor_run() {
         buffered_end=$(echo "$query_out" | jq -r '.bufferedEnd' 2>/dev/null)
         ready_state=$(echo "$query_out" | jq -r '.readyState' 2>/dev/null)
 
-        # --- 新增：检测下一集（URL 或 video src 变化） ---
-        local current_url current_src
+        # --- 新增：检测下一集（URL 变化） ---
+        local current_url
         current_url=$(echo "$query_out" | jq -r '.url // empty' 2>/dev/null)
-        current_src=$(echo "$query_out" | jq -r '.src // empty' 2>/dev/null)
         
         if [ -n "$current_url" ] && [ -n "$last_url" ] && [ "$current_url" != "$last_url" ] && [ "$ready_state" -ge 2 ]; then
-            _monitor_log "⏭️  检测到 URL 变化：$last_url -> $current_url (readyState=$ready_state)"
-            sidecar_set "$sidecar" next_url "$current_url"
-            sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
-            end_reason="next_episode"
-            break
-        fi
-        if [ -n "$current_src" ] && [ -n "$last_src" ] && [ "$current_src" != "$last_src" ] && [ "$ready_state" -ge 2 ]; then
-            _monitor_log "⏭️  检测到 video.src 变化 (readyState=$ready_state)"
-            sidecar_set "$sidecar" next_url "$current_url"
-            sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
-            end_reason="next_episode"
-            break
+            # 守卫：避免开头预加载 src 变化误判
+            local ct=${current_time:-0}
+            local dur=${duration:-0}
+            if [ "$(awk -v t="$ct" 'BEGIN{print (t>30)}')" = "1" ] && [ "$(awk -v d="$dur" 'BEGIN{print (d>60)}')" = "1" ]; then
+                _monitor_log "⏭️  检测到 URL 变化：$last_url -> $current_url (readyState=$ready_state)"
+                sidecar_set "$sidecar" next_url "$current_url"
+                sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
+                end_reason="next_episode"
+                break
+            else
+                _monitor_debug "⏭️  忽略 URL 变化（当前 ${ct}s，总 ${dur}s，疑为预加载）"
+            fi
         fi
         last_url="$current_url"
-        last_src="$current_src"
 
         # 更新 sidecar
         sidecar_set "$sidecar" video_state "\"$video_state\""
