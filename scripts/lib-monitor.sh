@@ -212,6 +212,9 @@ monitor_run() {
         sleep 3
     fi
 
+    # --- 追踪 URL / src 变化（用于 next_episode 检测） ---
+    local last_url="" last_src="" episode_index=1
+
     # === 主循环 ===
     while true; do
         sleep "$MONITOR_INTERVAL"
@@ -273,6 +276,28 @@ monitor_run() {
         duration=$(echo "$query_out" | jq -r '.duration' 2>/dev/null)
         buffered_end=$(echo "$query_out" | jq -r '.bufferedEnd' 2>/dev/null)
         ready_state=$(echo "$query_out" | jq -r '.readyState' 2>/dev/null)
+
+        # --- 新增：检测下一集（URL 或 video src 变化） ---
+        local current_url current_src
+        current_url=$(echo "$query_out" | jq -r '.url // empty' 2>/dev/null)
+        current_src=$(echo "$query_out" | jq -r '.src // empty' 2>/dev/null)
+        
+        if [ -n "$current_url" ] && [ -n "$last_url" ] && [ "$current_url" != "$last_url" ] && [ "$ready_state" -ge 2 ]; then
+            _monitor_log "⏭️  检测到 URL 变化：$last_url -> $current_url (readyState=$ready_state)"
+            sidecar_set "$sidecar" next_url "$current_url"
+            sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
+            end_reason="next_episode"
+            break
+        fi
+        if [ -n "$current_src" ] && [ -n "$last_src" ] && [ "$current_src" != "$last_src" ] && [ "$ready_state" -ge 2 ]; then
+            _monitor_log "⏭️  检测到 video.src 变化 (readyState=$ready_state)"
+            sidecar_set "$sidecar" next_url "$current_url"
+            sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
+            end_reason="next_episode"
+            break
+        fi
+        last_url="$current_url"
+        last_src="$current_src"
 
         # 更新 sidecar
         sidecar_set "$sidecar" video_state "\"$video_state\""

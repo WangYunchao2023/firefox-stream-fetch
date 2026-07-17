@@ -116,6 +116,24 @@ def _build_query_fn(video_selector=None):
   else if (v.paused) state = 'paused';
   else if (v.readyState < 3) state = 'buffering';
   else state = 'playing';
+  
+  // === next_episode detection: track URL + src changes === 
+  if (!window.__last_video_info) {{
+    window.__last_video_info = {{url: location.href, src: (v.currentSrc || v.src || '').slice(-120)}};
+  }}
+  const last = window.__last_video_info;
+  const curUrl = location.href;
+  const curSrc = (v.currentSrc || v.src || '').slice(-120);
+  const urlChanged = curUrl !== last.url;
+  const srcChanged = curSrc && curSrc !== last.src;
+  let nextEpisodeUrl = null;
+  if (urlChanged && srcChanged && v.readyState >= 2) {{
+    state = 'next_episode';
+    nextEpisodeUrl = curUrl;
+  }}
+  // Update tracker (even on next_episode, so next cycle has fresh baseline)
+  window.__last_video_info = {{url: curUrl, src: curSrc}};
+  
   return JSON.stringify({{
     state: state,
     paused: v.paused,
@@ -125,13 +143,14 @@ def _build_query_fn(video_selector=None):
     readyState: v.readyState,
     networkState: v.networkState,
     bufferedEnd: bufferedEnd,
-    src: (v.currentSrc || v.src || '').slice(-120),
+    src: curSrc,
     error: v.error ? v.error.code : 0,
     errorMsg: v.error ? v.error.message : '',
     videoWidth: v.videoWidth,
     videoHeight: v.videoHeight,
     visibility: document.visibilityState,
-    url: location.href,
+    url: curUrl,
+    next_episode_url: nextEpisodeUrl
   }});
 }}"""
 

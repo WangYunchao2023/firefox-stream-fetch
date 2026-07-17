@@ -50,6 +50,38 @@ firefox-stream-fetch/
 
 ## 版本记录
 
+### v3.1.0 (2026-07-17)
+
+**自动连集：每集独立 mp4、URL+src 双信号切集检测、顺序命名**
+
+| 维度 | 内容 |
+|---|---|
+| **核心成果** | `--auto-next` 正式可用：playlist 自动连集，每集独立 `host-01.mp4`, `host-02.mp4`... |
+| **切集检测** | BiDi 轮询时双信号确认：`location.href` 变化 + `<video>.currentSrc` 变化 + `readyState >= 2` |
+| **数据流** | monitor 写 sidecar `next_url` + `episode_index` → capture.sh 循环读取 → Phase 2 重跑 |
+| **命名** | 固定顺序命名 `{host}-{02d}.mp4`（无需额外参数） |
+| **回退** | 无下一集 / 用户未开 `--auto-next` → 单集正常结束 |
+
+---
+
+### v3.0.0 (2026-07-17)
+
+**统一抓取入口、保留两阶段架构、环境变量代理、兼容旧脚本**
+
+| 维度 | 内容 |
+|---|---|
+| **核心成果** | 4 个 site 适配脚本合并为 1 个 `capture.sh`；旧脚本保留为 1 行 shim 兼容
+| **架构** | Phase 1（过验证/加载，sandbox 开） → Phase 2（抓流，sandbox 关）两阶段保留
+| **代理策略** | 统一读 `http_proxy/https_proxy/all_proxy` 环境变量；Phase 1 显式 unset 避免 CF 检测
+| **输出目录** | 默认 `~/Videos/firefox抓取/`，文件名 `<host>-<timestamp>.mp4`
+| **监控** | lib-monitor.sh 智能监控（BiDi 5s 轮询 video.state + ended/stall/paused/no-video + 自动恢复 ≤3 次）
+| **反指纹** | Phase 1 最小 prefs（真实 UA + sandbox 开），Phase 2 关 sandbox 允许写盘
+| **音视频** | H.264/HEVC/AV1 自动 dispatch + AAC 双轨，合流 ffmpeg `-c copy`
+| **兼容** | `capture-olevod.sh/youtube.sh/yfsp.sh` 透传参数到 `capture.sh`
+| **验证** | olevod.com 明文流端到端跑通（178MB h264 + 11MB aac → mp4）
+
+---
+
 ### v2.2.0 (2026-07-16)
 
 **修复：Phase 1 → Phase 2 真正能自动切换（CF 反检测）**

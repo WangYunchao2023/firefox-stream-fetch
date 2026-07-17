@@ -1,0 +1,14 @@
+# Firefox Stream Fetch v1.1.0
+# Override Wayland default: force X11-only explicitly
+
+# Set PERFHERDER_EXTRA_OPTIONS to "x11" so mozconfig.linux uses x11-only
+export PERFHERDER_EXTRA_OPTIONS=x11
+
+# Source the standard linux mozconfig which will use x11-only
+. "$topsrcdir/build/mozconfig.common"
+
+# After sourcing common, override any settings
+ac_add_options --enable-optimize="-O2 -march=native"
+ac_add_options --enable-release
+ac_add_options --enable-webrender
+ac_add_options --enable-eme=wpe
