@@ -84,7 +84,8 @@ done
 # 推导常量
 # ═══════════════════════════════════════════════════════════════════════
 FF=$(find -L "$PROJECT/obj-stream" -path "*dist/bin/firefox" -type f -executable 2>/dev/null | head -1)
-[ -z "$FF" ] && { echo "❌ 找不到 patched firefox（$PROJECT/obj-stream/*/dist/bin/firefox）"; exit 1; }
+[ -z "$FF" ] && FF=$(find -L "$PROJECT/firefox/obj-x86_64-pc-linux-gnu" -path "*dist/bin/firefox" -type f -executable 2>/dev/null | head -1)
+[ -z "$FF" ] && { echo "❌ 找不到 patched firefox（$PROJECT/obj-stream/*/dist/bin/firefox 或 $PROJECT/firefox/obj-x86_64-pc-linux-gnu/dist/bin/firefox）"; exit 1; }
 FF_DIR=$(dirname "$FF")
 
 mkdir -p "$OUTPUT_DIR"
