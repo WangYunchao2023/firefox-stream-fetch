@@ -45,15 +45,27 @@ _monitor_debug() {
 # 启动 firefox
 _monitor_start_firefox() {
     local ff_bin="$1" profile="$2" url="$3"
+    local firefox_log="${4:-}"  # 可选第 4 参数: firefox stdout/stderr 重定向目标,默认 dump 同目录 .log
     # Firefox stdout/stderr (含 StreamDumper 帧日志) 写到 dump 同目录 .log，供后续 mux_to_mp4 提取时间戳
-    local dump_log="${MOZ_STREAM_DUMP_PATH%.h264}.log"
+    # 预热阶段 MOZ_STREAM_DUMP_PATH=/dev/null,${...%.h264}.log 会变成 /dev/null.log（无写权限）
+    # 这种情况 fallback 到 /dev/null,丢弃 firefox stdout/stderr
+    if [ -z "$firefox_log" ]; then
+        case "${MOZ_STREAM_DUMP_PATH:-}" in
+            /dev/null|/dev/null.*)
+                firefox_log="/dev/null"
+                ;;
+            *)
+                firefox_log="${MOZ_STREAM_DUMP_PATH%.h264}.log"
+                ;;
+        esac
+    fi
     setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
         -remote-allow-origins '*' \
         "$url" \
-        < /dev/null > "$dump_log" 2>&1 &
+        < /dev/null > "$firefox_log" 2>&1 &
     local pid=$!
     disown
     echo "$pid"
@@ -257,8 +269,11 @@ monitor_run() {
     _monitor_log "🔥 预热 firefox（dump 临时写 /dev/null，等真视频 ready 后重启, 超时 ${preheat_timeout}s）"
     export MOZ_STREAM_DUMP_PATH="/dev/null"
 
-    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url")
-    _monitor_log "   preheat firefox PID=$ff_pid"
+    # 预热 firefox stdout/stderr 写到 LOG（这样 firefox 自己的错误信息能保留下来，便于排查）
+    # LOG 通过 MOZ_LOG_FILE env 传给 firefox（_monitor_start_firefox 第 4 参数）
+    local _preheat_log="${MOZ_LOG_FILE:-/tmp/firefox-stream-preheat.log}"
+    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url" "$_preheat_log")
+    _monitor_log "   preheat firefox PID=$ff_pid log=$_preheat_log"
 
     if _monitor_wait_for_bidi 30; then
         daemon_pid=$(_monitor_daemon_start)

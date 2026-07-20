@@ -441,11 +441,14 @@ phase2() {
     echo "╚════════════════════════════════════════════════════════════╝"
     echo ""
 
+    # --skip-phase1 时 profile 目录可能不存在,确保存在
+    [ -d "$PROFILE" ] || mkdir -p "$PROFILE"
+
     # 关 sandbox（StreamDumper 写 /tmp 需要）
+    # prefs.js 可能不存在（全新 profile）, touch 一下
     local PJS="$PROFILE/prefs.js"
-    if [ -f "$PJS" ]; then
-        sed -i '/user_pref("security\.sandbox/d' "$PJS" 2>/dev/null || true
-    fi
+    [ -f "$PJS" ] || touch "$PJS"
+    sed -i '/user_pref("security\.sandbox/d' "$PJS" 2>/dev/null || true
     cat >> "$PJS" << 'EP'
 // === Phase 2: 关 sandbox 让 StreamDumper 写盘 ===
 user_pref("security.sandbox.content.level", 0);
@@ -481,6 +484,8 @@ EP
 
     # Phase 2 必须 export MOZ_STREAM_DUMP_PATH 给 StreamDumper（Phase 1 设为 /dev/null）
     export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
+    # 预热 firefox stdout/stderr 写到 $LOG（让 firefox 自己的错误信息能保留）
+    export MOZ_LOG_FILE="$LOG"
 
     # Phase 2 URL 优先级：命令行 URL > phase1 URL（从 sessionstore 提取）> about:home
     # phase1 firefox 关闭后,我们解析 sessionstore 拿到用户实际访问的 URL,写到 $PROFILE/.phase1_url
@@ -496,9 +501,18 @@ EP
     fi
     PHASE2_URL="${PHASE2_URL:-about:home}"
 
+    # 明确告知用户 firefox 要启动（避免他们以为 phase2 卡住）
+    echo "🚀 启动 Phase 2 Firefox..."
+    echo "   URL: $PHASE2_URL"
+    echo "   Profile: $PROFILE"
+    echo "   详细日志: $LOG"
+    echo ""
+
+    # monitor_run 内部日志（_monitor_log 写 stderr）同时输出到终端 + 写 LOG,
+    # 让用户能看 firefox 启动 / 预热 / 真 firefox 启动 / daemon ready 进度
     local monitor_result
     monitor_result=$(monitor_run "$FF" "$PROFILE" "$PHASE2_URL" \
-        "$DUMP_FILE" "$AUDIO_DUMP" "$SIDECAR" 2>>"$LOG")
+        "$DUMP_FILE" "$AUDIO_DUMP" "$SIDECAR" 2> >(tee -a "$LOG" >&2))
 
     echo "$monitor_result"
     local reason interrupt final_video final_audio
