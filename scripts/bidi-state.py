@@ -127,7 +127,8 @@ def _build_query_fn(video_selector=None):
   const urlChanged = curUrl !== last.url;
   const srcChanged = curSrc && curSrc !== last.src;
   let nextEpisodeUrl = null;
-  if (urlChanged && srcChanged && v.readyState >= 2) {{
+  // Guard: avoid false positives from preload / quality switch (need >30s played and duration >60s)
+  if (urlChanged && srcChanged && v.readyState >= 2 && v.currentTime > 30 && v.duration > 60) {{
     state = 'next_episode';
     nextEpisodeUrl = curUrl;
   }}

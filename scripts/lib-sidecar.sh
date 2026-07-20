@@ -56,6 +56,7 @@ sidecar_init() {
   "interrupt_count": 0,
   "interrupt_reasons": [],
   "parts": [],
+  "last_ff_url": null,
   "ended_at": null
 }
 JSON
