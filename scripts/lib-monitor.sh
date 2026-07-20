@@ -129,10 +129,12 @@ _monitor_query() {
     "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd query 2>/dev/null
 }
 
-# 等待真视频 ready（用于 firefox 预热阶段）
-#   判定: url 是 http(s) + video.readyState>=3 + currentTime>=2 + duration>=30
+# 等待真页面 ready（用于 firefox 预热阶段）
+#   判定: url 是 http(s) 且不在 CF challenge 子域 → 立即 ready
+#         (StreamDumper 在新 firefox 进程里干净初始化即可, 不需等 video metadata 加载)
+#   兜底: video.readyState>=3 + currentTime>=2 + duration>=30 (用户用 file:// 等)
 #   timeout: 秒（默认 60s）
-#   return 0: 真视频 ready / 1: timeout
+#   return 0: 真页面 ready / 1: timeout
 _monitor_wait_real_video() {
     local timeout="${1:-60}"
     local elapsed=0
@@ -152,17 +154,18 @@ _monitor_wait_real_video() {
                     # about:home / about:newtab / about:blank 是 firefox 内部页（用户还没输入 URL）
                     _monitor_debug "   preheat: waiting url=$url (用户尚未输入 URL 或 firefox 内部页)"
                     ;;
+                *challenges.cloudflare.com*)
+                    # CF challenge 中,等通过
+                    _monitor_debug "   preheat: CF challenge in progress ($url)"
+                    ;;
                 http://*|https://*)
-                    if [ "$ready" -ge 3 ] && \
-                       [ "$(awk -v t="$cur" 'BEGIN{print (t>=2)?1:0}')" = "1" ] && \
-                       [ "$(awk -v d="$dur" 'BEGIN{print (d>30)?1:0}')" = "1" ]; then
-                        _monitor_log "   ✅ 真视频 ready: $url (ct=${cur}s dur=${dur}s ready=$ready)"
-                        return 0
-                    fi
-                    _monitor_debug "   preheat: url=$url ready=$ready ct=${cur}s dur=${dur}s state=$state"
+                    # 真页面 URL,firefox 已经在目标域 → 预热完成
+                    # 新 firefox 启动时 StreamDumper 干净初始化,写真视频 SPS/PPS
+                    _monitor_log "   ✅ 真页面 ready: $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                    return 0
                     ;;
                 *)
-                    # 其他 URL（file:// 等），按 readyState+duration 判定
+                    # 其他 URL（file:// 等），按 video metadata 兜底判定
                     if [ "$ready" -ge 3 ] && \
                        [ "$(awk -v t="$cur" 'BEGIN{print (t>=2)?1:0}')" = "1" ] && \
                        [ "$(awk -v d="$dur" 'BEGIN{print (d>30)?1:0}')" = "1" ]; then
