@@ -46,6 +46,7 @@ while [[ $# -gt 0 ]]; do
         --skip-phase1)     SKIP_PHASE1=1; shift;;
         --keep-h264)       KEEP_H264=1; shift;;
         --profile)         PROFILE_PATH="$2"; shift 2;;
+        --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
 firefox-stream-fetch 统一抓取脚本 v3.0
@@ -63,12 +64,14 @@ OPTIONS:
     --skip-phase1             跳过 Phase 1（profile 已有可用 cookie 时等价行为）
     --keep-h264               保留 .h264/.aac 中间文件（默认封 mp4 后删除）
     --profile PATH            自定义 profile 路径
+    --proxy URL               强制指定代理（http://host:port 或 socks5://host:port）
 
 例子:
     capture.sh
     capture.sh https://www.olevod.com/player/vod/1-82695-1.html
     capture.sh https://www.yfsp.tv/watch?v=ztgsSWh5mPZEhhazLjYUG6 --auto-next
     capture.sh https://www.youtube.com/watch?v=_n4SRDYkhqs --keep-h264
+    capture.sh https://example.com/video --proxy socks5://127.0.0.1:1080
 
 环境变量:
     http_proxy / https_proxy / all_proxy    系统代理（任意一个设了就生效）
@@ -133,11 +136,20 @@ _clear_proxy_env() {
 }
 
 _apply_proxy_env() {
-    : # noop: 环境变量自然继承
+    # --proxy 强制覆盖：写到标准 *proxy 变量,让 firefox 自然继承
+    if [ -n "${FORCE_PROXY:-}" ]; then
+        if [[ "$FORCE_PROXY" == socks5://* ]]; then
+            export socks_proxy="$FORCE_PROXY" SOCKS_PROXY="$FORCE_PROXY"
+        else
+            export http_proxy="$FORCE_PROXY" https_proxy="$FORCE_PROXY" all_proxy="$FORCE_PROXY"
+            export HTTP_PROXY="$FORCE_PROXY" HTTPS_PROXY="$FORCE_PROXY" ALL_PROXY="$FORCE_PROXY"
+        fi
+    fi
+    # 其他情况：环境变量自然继承（firefox 自动读系统代理，见使用说明.md）
 }
 
 has_proxy_env() {
-    [ -n "${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}" ]
+    [ -n "${FORCE_PROXY:-}${http_proxy:-}${https_proxy:-}${HTTP_PROXY:-}${HTTPS_PROXY:-}${all_proxy:-}${ALL_PROXY:-}${socks_proxy:-}${SOCKS_PROXY:-}" ]
 }
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -145,6 +157,58 @@ has_proxy_env() {
 # ═══════════════════════════════════════════════════════════════════════
 clear_locks() {
     rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock"
+}
+
+# 启动前清理：杀掉上次残留 firefox / bidi daemon 进程，清 profile lock / socket / phase1_url 临时文件
+# 解决上次崩溃或手动 ctrl+c 退出后,残留进程持有 lock 导致本次 firefox 启动失败 / BiDi 端口冲突
+_cleanup_on_start() {
+    # 临时关闭 set -e：pipeline 里 grep 无匹配会 exit 1，但这是正常情况不应该让脚本退出
+    set +e
+    local cleaned=0
+
+    # 1. 残留 firefox 进程（同一 profile 路径）
+    if [ -n "${PROFILE:-}" ] && [ -d "$PROFILE" ]; then
+        local ff_pids
+        ff_pids=$(ps -ef | grep -v grep | grep -F "firefox" | grep -F -- "-profile $PROFILE" | awk '{print $2}' 2>/dev/null)
+        if [ -n "$ff_pids" ]; then
+            echo "🧹 清理残留 firefox 进程（profile=$PROFILE_NAME）: $(echo "$ff_pids" | wc -l) 个"
+            echo "$ff_pids" | xargs -r kill -9 2>/dev/null || true
+            sleep 1
+            cleaned=1
+        fi
+    fi
+
+    # 2. 残留 bidi daemon 进程（任何 profile 都可能残留）
+    local daemon_pids
+    daemon_pids=$(ps -ef | grep -v grep | grep -F "bidi-state.py daemon" | awk '{print $2}' 2>/dev/null)
+    if [ -n "$daemon_pids" ]; then
+        echo "🧹 清理残留 bidi daemon 进程: $(echo "$daemon_pids" | wc -l) 个"
+        echo "$daemon_pids" | xargs -r kill -9 2>/dev/null || true
+        cleaned=1
+    fi
+
+    # 3. 残留 unix socket（bidi daemon 的）
+    if [ -S /tmp/bidi-monitor.sock ]; then
+        rm -f /tmp/bidi-monitor.sock
+        echo "🧹 清理残留 unix socket: /tmp/bidi-monitor.sock"
+        cleaned=1
+    fi
+
+    # 4. profile lock 文件（防止 firefox 启动拒绝）
+    if [ -n "${PROFILE:-}" ]; then
+        rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock" 2>/dev/null || true
+    fi
+
+    # 5. 上次 phase1 提取的 URL 临时文件（避免本次误用上次的 URL）
+    if [ -n "${PROFILE:-}" ] && [ -f "$PROFILE/.phase1_url" ]; then
+        rm -f "$PROFILE/.phase1_url"
+        echo "🧹 清理上次的 phase1 URL 临时文件"
+        cleaned=1
+    fi
+
+    [ $cleaned -eq 1 ] && sleep 1  # 给系统一点时间释放端口 / inode
+    set -e
+    return 0
 }
 
 get_firefox_wid() {
@@ -187,6 +251,49 @@ has_valid_cf_cookie() {
     [ "$count" -gt 0 ]
 }
 
+# 从 firefox sessionstore-backups/recovery.jsonlz4 (mozLz40 格式) 解析最近 tab 的 URL
+# 用于 phase1 firefox 关闭后,把用户实际访问的 URL 传给 phase2,免去手动重输
+# 用法: _extract_phase1_url <profile_dir>
+_extract_phase1_url() {
+    local profile="$1"
+    local session_file=""
+    # 优先 recovery.jsonlz4 (最新),否则 fallback 到 sessionstore.js (老格式)
+    if [ -f "$profile/sessionstore-backups/recovery.jsonlz4" ]; then
+        session_file="$profile/sessionstore-backups/recovery.jsonlz4"
+    elif [ -f "$profile/sessionstore.js" ]; then
+        session_file="$profile/sessionstore.js"
+    else
+        return 1
+    fi
+    python3 -c "
+import sys, json
+try:
+    try:
+        import lz4.block
+        with open('$session_file', 'rb') as f:
+            raw = f.read()
+        if raw.startswith(b'mozLz40\x00'):
+            data = lz4.block.decompress(raw[8:])
+        else:
+            data = raw
+    except ImportError:
+        with open('$session_file', 'rb') as f:
+            raw = f.read()
+        data = raw[8:] if raw.startswith(b'mozLz40\x00') else raw
+    d = json.loads(data)
+    for w in d.get('windows', []):
+        for t in w.get('tabs', []):
+            for e in t.get('entries', []):
+                url = e.get('url', '')
+                if url.startswith('http://') or url.startswith('https://'):
+                    print(url)
+                    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Phase 1 — 用户交互阶段（让人过 CF / 输入 URL）
 # ═══════════════════════════════════════════════════════════════════════
@@ -203,7 +310,8 @@ phase1() {
         return 0
     fi
 
-    # 准备新 profile（或复用现有，但开始清 prefs）
+    # 准备新 profile：删旧 profile 重建（避免残留 lock / 损坏 sessionstore 导致 firefox crash）
+    rm -rf "$PROFILE"
     mkdir -p "$PROFILE"
     cat > "$PROFILE/user.js" << 'PJEOF'
 // === v3.0 Phase 1 反指纹 prefs（实测通过 CF Turnstile） ===
@@ -298,6 +406,15 @@ PJEOF
 
                 # 没 cf_clearance 也继续（可能不需要 CF）
                 clear_locks
+
+                # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
+                local phase1_url=""
+                phase1_url=$(_extract_phase1_url "$PROFILE")
+                if [ -n "$phase1_url" ]; then
+                    echo "$phase1_url" > "$PROFILE/.phase1_url"
+                    echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
+                fi
+
                 echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
                 return 0
             fi
@@ -365,8 +482,19 @@ EP
     # Phase 2 必须 export MOZ_STREAM_DUMP_PATH 给 StreamDumper（Phase 1 设为 /dev/null）
     export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
 
-    # Phase 2 URL 优先级：起始传入 > profile 中保存的 session tab
-    local PHASE2_URL="${URL:-about:home}"
+    # Phase 2 URL 优先级：命令行 URL > phase1 URL（从 sessionstore 提取）> about:home
+    # phase1 firefox 关闭后,我们解析 sessionstore 拿到用户实际访问的 URL,写到 $PROFILE/.phase1_url
+    # phase2 自动续接,免去用户手动重输
+    local PHASE2_URL=""
+    if [ -n "${URL:-}" ]; then
+        PHASE2_URL="$URL"
+    elif [ -s "$PROFILE/.phase1_url" ]; then
+        PHASE2_URL=$(cat "$PROFILE/.phase1_url" 2>/dev/null || true)
+        if [ -n "$PHASE2_URL" ]; then
+            echo "  📎 Phase2 URL 续接 Phase1: $PHASE2_URL"
+        fi
+    fi
+    PHASE2_URL="${PHASE2_URL:-about:home}"
 
     local monitor_result
     monitor_result=$(monitor_run "$FF" "$PROFILE" "$PHASE2_URL" \
@@ -384,6 +512,9 @@ EP
         stall_limit)       echo "  📦 流停滞兜底结束";;
         paused_too_long)   echo "  ⏸️  长时间暂停";;
         max_interrupts)    echo "  ❌ 崩溃恢复次数达到上限";;
+        next_episode)
+            echo "  ⏭️  检测到下一集（当前集 dump 已滚动到 .p1，合成 mp4）"
+            ;;
         *)                 echo "  ⚠️  reason=$reason";;
     esac
     if [ "$interrupt" -gt 0 ]; then
@@ -391,18 +522,12 @@ EP
     fi
 
     # 合成 mp4
+    # 注：next_episode 时 DUMP_FILE 已被 monitor 滚到 .p1.h264，需传 out_base 给 mux 让其正确算 parts glob
     if [ -s "$DUMP_FILE" ] || [ -s "$AUDIO_DUMP" ]; then
-        mux_to_mp4 "$DUMP_FILE" "$AUDIO_DUMP" "${out_base}.mp4"
+        mux_to_mp4 "$DUMP_FILE" "$AUDIO_DUMP" "${out_base}.mp4" "$out_base"
     else
         echo "  ⚠️  Phase 2 无 dump 文件（视频可能未进入播放）"
         return 1
-    fi
-
-    # auto-next 占位提示
-    if [ "$AUTO_NEXT" -eq 1 ]; then
-        echo ""
-        echo "  ℹ️  --auto-next 模式已置位，但 monitor 切集检测在 v3.1 才实现。"
-        echo "     当前将只产出第一集 mp4。如需 playlist 全抓，可多次运行（每换 URL）"
     fi
 }
 
@@ -410,8 +535,9 @@ EP
 # mp4 封装（含分段 concat + AAC 双轨）
 # ═══════════════════════════════════════════════════════════════════════
 mux_to_mp4() {
-    local dump="$1" audio="$2" out="$3"
-    local base="${dump%.h264}"
+    local dump="$1" audio="$2" out="$3" base_arg="${4:-}"
+    # base 默认 = dump 去 .h264（next_episode 时 dump 已是 .p1.h264，需要 OUT_BASE 真实 base 来算 parts）
+    local base="${base_arg:-${dump%.h264}}"
 
     echo "🎬 封装 → $out"
 
@@ -479,29 +605,41 @@ main() {
     echo "  Auto-next:     $([ $AUTO_NEXT -eq 1 ] && echo '✅' || echo '❌')"
     echo ""
 
+    # 启动前清理：避免上次崩溃 / 手动退出留下的残留导致本次启动失败
+    _cleanup_on_start
+
     local phase2_ret=0
     local episode=1
+    export EPISODE=$episode
     while true; do
         if [ $SKIP_PHASE1 -eq 0 ]; then
             phase1 || { echo "❌ Phase 1 失败"; return 1; }
         fi
         phase2 || phase2_ret=$?
         
-        # --- auto-next: 检查 sidecar 是否有 next_url ---
-        if [ $AUTO_NEXT -eq 1 ]; then
-            local sidecar
-            sidecar=$(ls -t "$OUTPUT_DIR"/${BASE_NAME}-*.sidecar.json 2>/dev/null | head -1)
-            if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
-                local next_url
-                next_url=$(jq -r '.next_url // empty' "$sidecar" 2>/dev/null)
-                if [ -n "$next_url" ] && [ "$next_url" != "null" ]; then
+        # --- 下一集检测（无论 AUTO_NEXT 是否开启，都查 sidecar.next_url） ---
+        #   AUTO_NEXT=1 → 自动切下一集（每 phase2 = 1 集，每集独立 mp4）
+        #   AUTO_NEXT=0 → 默认行为，提示后结束（当前集已保存）
+        local sidecar
+        sidecar=$(ls -t "$OUTPUT_DIR"/${BASE_NAME}-*.sidecar.json 2>/dev/null | head -1)
+        if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
+            local next_url
+            next_url=$(jq -r '.next_url // empty' "$sidecar" 2>/dev/null)
+            if [ -n "$next_url" ] && [ "$next_url" != "null" ]; then
+                if [ $AUTO_NEXT -eq 1 ]; then
                     echo ""
                     echo "═══════════════════════════════════════════════════════"
-                    echo "  ⏭️  自动切下一集: $next_url"
+                    echo "  ⏭️  自动切下一集 (--auto-next): $next_url"
                     echo "═══════════════════════════════════════════════════════"
                     URL="$next_url"
                     episode=$((episode + 1))
+                    export EPISODE=$episode
                     continue
+                else
+                    echo ""
+                    echo "ℹ️  检测到下一集但未开启 --auto-next，当前集已保存为 mp4："
+                    echo "    下一集 URL: $next_url"
+                    echo "    如需自动抓完整个 playlist，请加 --auto-next 重启。"
                 fi
             fi
         fi
