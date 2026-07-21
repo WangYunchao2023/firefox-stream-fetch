@@ -62,7 +62,6 @@ _monitor_start_firefox() {
     setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
-        -no-session-restore \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
         -remote-allow-origins '*' \
         "$url" \
@@ -128,6 +127,41 @@ _monitor_daemon_stop() {
 # 通过 daemon 调用 query
 _monitor_query() {
     "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd query 2>/dev/null
+}
+
+# v3.3 门控: 轮询 video 状态,达到 readyState>=3 + currentTime>1 后创建哨兵文件
+# StreamDumper C++ 检测哨兵后开始写 dump
+_monitor_enable_dump_when_ready() {
+    local timeout="${1:-90}"
+    local elapsed=0
+    local sentinel="/tmp/firefox-stream-dump-enabled"
+
+    # 清理可能残留的旧哨兵
+    rm -f "$sentinel"
+
+    _monitor_log "   ⏳ 等待 video.readyState>=3 + currentTime>1 后创建哨兵..."
+    while [ $elapsed -lt $timeout ]; do
+        local q
+        q=$(_monitor_query 2>/dev/null)
+        if [ -n "$q" ]; then
+            local ready_state current_time video_state
+            ready_state=$(echo "$q" | jq -r '.readyState // 0' 2>/dev/null)
+            current_time=$(echo "$q" | jq -r '.currentTime // 0' 2>/dev/null)
+            video_state=$(echo "$q" | jq -r '.state // "unknown"' 2>/dev/null)
+            if [ "$ready_state" -ge 3 ] 2>/dev/null \
+                && [ "$(awk -v t="$current_time" 'BEGIN{print (t > 1)}')" = "1" ]; then
+                # 达到条件: 创建哨兵文件
+                if "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump 2>/dev/null; then
+                    _monitor_log "   ✅ 门控启用 (readyState=$ready_state currentTime=$current_time state=$video_state) → StreamDumper 开始写 dump"
+                    return 0
+                fi
+            fi
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+    _monitor_log "   ⚠️  ${timeout}s 未达到 video readyState>=3+currentTime>1, dump 未启用"
+    return 1
 }
 
 # 等待真页面 ready（用于 firefox 预热阶段）
@@ -313,85 +347,29 @@ monitor_run() {
     export MOZ_STREAM_DUMP_PATH="$dump_video"
     local daemon_pid=""
 
-    # 火狐预热：避免 about:home / 中间跳转页 / 广告等 "非真视频" 内容被 StreamDumper 先写进 dump。
-    # StreamDumper 是 firefox 进程内的 static 状态,首次触发的 SPS/PPS 一旦写入文件,整个 firefox
-    # 生命周期不再重写。真视频帧用错 SPS 解码失败 → mp4 时长错乱、音画不同步。
-    # 同时支持两种 URL 模式:
-    #   - http(s): URL 已知,firefox 启动后等到真视频 ready 即 kill+restart
-    #   - about:* (用户没传 URL,firefox 启动 about:home 等用户输入),firefox 启动后等到 URL=http(s) + 真视频 ready 才 kill+restart
-    #   - manual_url_mode=1 (Phase 1 手工 URL): 无限等待 state=playing,不超时 fallback
-    local preheat_done=0
-    local preheat_timeout=90
-    if [[ "$url" == http://* || "$url" == https://* ]]; then
-        preheat_timeout=60  # URL 已知,真视频 ready 应该 30s 内
-    fi
+    # === v3.3 firefox 只启动一次（不预热）===
+    # 设计: StreamDumper C++ 加哨兵门控。firefox 启动后不创建 dump 文件，
+    # BiDi 监控 video.readyState>=3 + currentTime>1，达到条件后创建哨兵文件，
+    # StreamDumper 才开始写真视频帧。避免了传统预热“杀 firefox 重启”的指纹变化问题。
+    _monitor_log "🚀 启动 firefox（一次性启动,不再预热）"
+    export MOZ_STREAM_DUMP_PATH="$dump_video"
 
-    # 手工 URL 模式：无限等待 playing，不设超时 fallback
-    if [ "$manual_url_mode" = "1" ]; then
-        preheat_timeout=0  # 0 表示无限等待
-    fi
-
-    _monitor_log "🔥 预热 firefox（dump 临时写 /dev/null，等真视频 playing 后重启, 超时 ${preheat_timeout}s, 0=无限等待）"
-    export MOZ_STREAM_DUMP_PATH="/dev/null"
-
-    # 预热 firefox stdout/stderr 写到 LOG（这样 firefox 自己的错误信息能保留下来，便于排查）
-    # LOG 通过 MOZ_LOG_FILE env 传给 firefox（_monitor_start_firefox 第 4 参数）
-    local _preheat_log="${MOZ_LOG_FILE:-/tmp/firefox-stream-preheat.log}"
-    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url" "$_preheat_log")
-    _monitor_log "   preheat firefox PID=$ff_pid log=$_preheat_log"
+    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url")
+    _monitor_log "   firefox PID=$ff_pid url=$url"
 
     if _monitor_wait_for_bidi 30; then
         daemon_pid=$(_monitor_daemon_start)
         if _monitor_daemon_wait 15; then
-            if [ "$preheat_timeout" -eq 0 ]; then
-                # 手工模式：无限等待 playing
-                _monitor_log "   👆 手工 URL 模式：无限等待视频 playing..."
-                if _monitor_wait_real_video_manual; then
-                    preheat_done=1
-                    # 从 firefox 拿到用户实际 URL（可能与传入 url 不同，如重定向）
-                    local q
-                    q=$(_monitor_query 2>/dev/null)
-                    if [ -n "$q" ]; then
-                        local real_url
-                        real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
-                        if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
-                            _monitor_log "   ✅ 确认 URL: $real_url (原 url=$url)"
-                            url="$real_url"
-                        fi
-                    fi
-                fi
-            else
-                if _monitor_wait_real_video "$preheat_timeout"; then
-                    preheat_done=1
-                    # 如果 url 是 about:*,从 firefox 拿到用户实际输入的 URL
-                    if [[ "$url" == about:* ]]; then
-                        local q
-                        q=$(_monitor_query 2>/dev/null)
-                        if [ -n "$q" ]; then
-                            local real_url
-                            real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
-                            if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
-                                _monitor_log "   ✅ 用户输入 URL: $real_url (原 url=$url)"
-                                url="$real_url"
-                            fi
-                        fi
-                    fi
-                else
-                    _monitor_log "   ⚠️  预热 ${preheat_timeout}s 未等到真视频 ready,继续主流程（dump 可能有污染）"
-                fi
-            fi
+            # 手工 URL 模式: 等用户输入 URL + 页面 readyState>=3 + currentTime>1
+            # URL 已知模式: 同样等真视频 ready
+            # 全程使用 _monitor_enable_dump_when_ready (包含 readyState + currentTime 检测)
+            _monitor_enable_dump_when_ready 120
         else
-            _monitor_log "   ⚠️  预热 daemon 未 ready,继续主流程"
+            _monitor_log "   ⚠️  daemon 未 ready, 继续主流程（StreamDumper 不会创建 dump 文件）"
         fi
     else
-        _monitor_log "   ⚠️  预热 firefox BiDi 未起来,继续主流程"
+        _monitor_log "   ⚠️  firefox BiDi 未起来, 继续主流程（StreamDumper 不会创建 dump 文件）"
     fi
-
-    _monitor_daemon_stop
-    kill -15 "$ff_pid" 2>/dev/null || true
-    sleep 1
-    kill -9 "$ff_pid" 2>/dev/null || true
-    ff_pid=""
 
     # 恢复真 dump 路径,启动正式 firefox (用用户实际 URL)
     export MOZ_STREAM_DUMP_PATH="$dump_video"

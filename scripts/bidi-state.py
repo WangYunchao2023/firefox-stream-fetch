@@ -459,6 +459,24 @@ def _dispatch(cmd_obj, sess):
         return sess.query(cmd_obj.get("url_pattern"), cmd_obj.get("video_selector"))
     elif cmd == "seek":
         return sess.seek(cmd_obj.get("seconds"), cmd_obj.get("url_pattern"), cmd_obj.get("video_selector"))
+    elif cmd == "enable_streamdump":
+        # 创建哨兵文件 -> StreamDumper 检测后开启 dump
+        sentinel = "/tmp/firefox-stream-dump-enabled"
+        try:
+            with open(sentinel, "w") as f:
+                f.write("enabled\n")
+            return {"ok": True, "sentinel": sentinel}
+        except Exception as e:
+            return {"err": f"create sentinel failed: {e}"}
+    elif cmd == "disable_streamdump":
+        sentinel = "/tmp/firefox-stream-dump-enabled"
+        try:
+            os.remove(sentinel)
+            return {"ok": True}
+        except FileNotFoundError:
+            return {"ok": True, "msg": "sentinel already absent"}
+        except Exception as e:
+            return {"err": f"remove sentinel failed: {e}"}
     else:
         return {"err": f"unknown cmd: {cmd}"}
 

@@ -1,0 +1,21 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] streamdumper: gate dump write on sentinel file
+
+Avoid dumping "fake" frames from session-restore / ad landing pages /
+about:home during firefox startup. StreamDumper now only writes dump
+files after a sentinel file appears, which BiDi creates when the
+target video element reaches readyState>=3 + currentTime>1.
+
+Mechanism:
+- sDumpEnabled static flag (default false)
+- Every 50 video samples / 100 audio samples: access("/tmp/firefox-stream-dump-enabled")
+- If file exists: sDumpEnabled = true, start writing on next sample
+- Otherwise: drop sample silently, no dump file created
+
+Exposed:
+- extern "C" void SetStreamDumpEnabled(bool)
+- extern "C" bool QueryStreamDumpEnabled()
+
+BiDi side will register a "streamDumper.enable" command that creates
+the sentinel file (so firefox's BiDi JS layer doesn't need to call
+into C++ directly).

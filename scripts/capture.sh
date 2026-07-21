@@ -253,44 +253,78 @@ has_valid_cf_cookie() {
 
 # 从 firefox sessionstore-backups/recovery.jsonlz4 (mozLz40 格式) 解析最近 tab 的 URL
 # 用于 phase1 firefox 关闭后,把用户实际访问的 URL 传给 phase2,免去手动重输
-# 用法: _extract_phase1_url <profile_dir>
+# 用法: _extract_phase1_url <profile_dir> [max_retries]
+# 从 sessionstore 提取 phase1 firefox 最后访问的 http(s) URL。
+# 返回 0 + 输出 URL 成功，非 0 表示失败。
+# 增强: firefox SIGTERM 后可能重写 sessionstore，轮询多次确保拿到稳定状态。
 _extract_phase1_url() {
     local profile="$1"
-    local session_file=""
-    # 优先 recovery.jsonlz4 (最新),否则 fallback 到 sessionstore.js (老格式)
-    if [ -f "$profile/sessionstore-backups/recovery.jsonlz4" ]; then
-        session_file="$profile/sessionstore-backups/recovery.jsonlz4"
-    elif [ -f "$profile/sessionstore.js" ]; then
-        session_file="$profile/sessionstore.js"
-    else
-        return 1
-    fi
-    python3 -c "
+    local max_retries="${2:-5}"
+    local retry=0
+    local session_files=()
+
+    while [ $retry -lt $max_retries ]; do
+        # 多候选文件（按优先级）
+        session_files=()
+        [ -f "$profile/sessionstore-backups/recovery.jsonlz4" ] && \
+            session_files+=("$profile/sessionstore-backups/recovery.jsonlz4")
+        [ -f "$profile/sessionstore-backups/recovery.baklz4" ] && \
+            session_files+=("$profile/sessionstore-backups/recovery.baklz4")
+        [ -f "$profile/sessionstore-backups/previous.jsonlz4" ] && \
+            session_files+=("$profile/sessionstore-backups/previous.jsonlz4")
+        [ -f "$profile/sessionstore.js" ] && \
+            session_files+=("$profile/sessionstore.js")
+
+        if [ ${#session_files[@]} -eq 0 ]; then
+            retry=$((retry + 1))
+            sleep 1
+            continue
+        fi
+
+        # 尝试每个候选文件
+        for sf in "${session_files[@]}"; do
+            local url
+            url=$(python3 -c "
 import sys, json
 try:
     try:
         import lz4.block
-        with open('$session_file', 'rb') as f:
+        with open('$sf', 'rb') as f:
             raw = f.read()
         if raw.startswith(b'mozLz40\x00'):
             data = lz4.block.decompress(raw[8:])
         else:
             data = raw
     except ImportError:
-        with open('$session_file', 'rb') as f:
+        with open('$sf', 'rb') as f:
             raw = f.read()
         data = raw[8:] if raw.startswith(b'mozLz40\x00') else raw
     d = json.loads(data)
+    # 优先: 最后一个 tab 的最后一个 entry
+    last_url = None
     for w in d.get('windows', []):
         for t in w.get('tabs', []):
             for e in t.get('entries', []):
-                url = e.get('url', '')
-                if url.startswith('http://') or url.startswith('https://'):
-                    print(url)
-                    sys.exit(0)
+                u = e.get('url', '')
+                if u.startswith('http://') or u.startswith('https://'):
+                    last_url = u
+    if last_url:
+        print(last_url); sys.exit(0)
+    sys.exit(2)
 except Exception:
     sys.exit(1)
-" 2>/dev/null
+" 2>/dev/null)
+            local rc=$?
+            if [ $rc -eq 0 ] && [ -n "$url" ]; then
+                echo "$url"
+                return 0
+            fi
+        done
+
+        retry=$((retry + 1))
+        sleep 1
+    done
+    return 1
 }
 
 
@@ -431,12 +465,14 @@ except Exception:
                         if [ "$cf_count" -gt 0 ]; then
                             echo "  ✅ Cookie 已落盘 ($cf_count 条 cf_clearance)"
                             clear_locks
-                            # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
+                            # firefox SIGTERM 后可能重写 sessionstore，多试几次
                             local phase1_url=""
-                            phase1_url=$(_extract_phase1_url "$PROFILE")
+                            phase1_url=$(_extract_phase1_url "$PROFILE" 10)
                             if [ -n "$phase1_url" ]; then
                                 echo "$phase1_url" > "$PROFILE/.phase1_url"
                                 echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
+                            else
+                                echo "  ⚠️  Sessionstore 10 次重试都拿不到 URL，phase2 将用 about:home + session restore"
                             fi
                             return 0
                         fi
@@ -447,17 +483,15 @@ except Exception:
 
                 # 没 cf_clearance 也继续（可能不需要 CF）
                 clear_locks
-
-                # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
+                # firefox SIGTERM 后可能重写 sessionstore，多试几次
                 local phase1_url=""
-                phase1_url=$(_extract_phase1_url "$PROFILE")
+                phase1_url=$(_extract_phase1_url "$PROFILE" 10)
                 if [ -n "$phase1_url" ]; then
                     echo "$phase1_url" > "$PROFILE/.phase1_url"
                     echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
                 else
-                    echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home"
+                    echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home + session restore"
                 fi
-
                 echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
                 return 0
             fi
@@ -499,9 +533,9 @@ user_pref("security.sandbox.gmp.level", 0);
 user_pref("security.sandbox.rdd.level", 0);
 user_pref("security.sandbox.socket.level", 0);
 user_pref("security.sandbox.utility.level", 0);
-// Phase 2 不恢复 session，避免重新打开 Phase 1 的 tabs
-user_pref("browser.startup.page", 0);
-user_pref("browser.sessionstore.resume_from_crash", false);
+// Phase 2 恢复 session (firefox 恢复 phase1 的标签页, cf_clearance cookie 复用, 不重新弹 CF)
+user_pref("browser.startup.page", 3);
+user_pref("browser.sessionstore.resume_from_crash", true);
 EP
 
     clear_locks
@@ -512,8 +546,8 @@ EP
     local AUDIO_DUMP="${out_base}.aac"
     local SIDECAR="${out_base}.sidecar.json"
 
-    echo "📦 Video dump: $DUMP_FILE"
-    echo "📦 Audio dump: $AUDIO_DUMP"
+    echo "📦 预定 dump (sentinel 启用后才创建): $DUMP_FILE"
+    echo "📦 预定 dump (sentinel 启用后才创建): $AUDIO_DUMP"
     echo "📋 Sidecar:    $SIDECAR"
     if has_proxy_env; then
         echo "🌐 代理: 环境变量 $(env | grep -iE '^(http|https|all|socks)_proxy=' | tr '\n' ' ')"
@@ -557,6 +591,11 @@ EP
     if [ $MANUAL_URL_MODE -eq 1 ]; then
         echo "   🔧 手工 URL 模式：等待用户点击播放后再开始抓取"
     fi
+    echo ""
+    echo "   ⏳ firefox 启动后，StreamDumper 默认丢弃所有 sample"
+    echo "   ⏳ BiDi 监控 video.readyState>=3 + currentTime>1 后创建哨兵"
+    echo "   ⏳ StreamDumper 检测到哨兵才开始写真视频帧 (才创建 dump 文件)"
+    echo "   ⏳ 请在 firefox 中过 CF / 进入视频页面，不要 Ctrl+C 中断"
     echo ""
 
     # monitor_run 内部日志（_monitor_log 写 stderr）同时输出到终端 + 写 LOG,
