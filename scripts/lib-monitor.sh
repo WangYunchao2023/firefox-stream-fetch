@@ -371,27 +371,7 @@ monitor_run() {
         _monitor_log "   ⚠️  firefox BiDi 未起来, 继续主流程（StreamDumper 不会创建 dump 文件）"
     fi
 
-    # 恢复真 dump 路径,启动正式 firefox (用用户实际 URL)
-    export MOZ_STREAM_DUMP_PATH="$dump_video"
-    _monitor_log "🚀 启动 firefox 监控 url=$url（dump_v=$dump_video dump_a=$dump_audio）"
-    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url")
-    _monitor_log "   firefox PID=$ff_pid"
-
-    if ! _monitor_wait_for_bidi 30; then
-        _monitor_log "❌ firefox 启动后 BiDi 端口 30s 内未起来"
-        kill -9 "$ff_pid" 2>/dev/null
-        return 1
-    fi
-    _monitor_log "   启动 bidi daemon（socket=$BIDI_SOCKET）"
-    daemon_pid=$(_monitor_daemon_start)
-    if ! _monitor_daemon_wait 15; then
-        _monitor_log "❌ daemon 15s 内未 ready"
-        kill -9 "$ff_pid" 2>/dev/null
-        kill -9 "$daemon_pid" 2>/dev/null
-        return 1
-    fi
-    _monitor_log "   daemon ready (PID=$daemon_pid), preheat_done=$preheat_done"
-
+    # === v3.3 修复: 已删除旧"启动 firefox 监控"块，避免双重启动 ===
     # Resume: seek 到断点
     if [ $is_resume -eq 1 ]; then
         local resume_time
@@ -435,6 +415,10 @@ monitor_run() {
             fi
             daemon_pid=$(_monitor_daemon_start)
             _monitor_daemon_wait 15 || true
+
+            # v3.3: firefox 重启后重新门控，删旧哨兵，等新哨兵
+            rm -f /tmp/firefox-stream-dump-enabled
+            _monitor_enable_dump_when_ready 120
 
             local resume_time
             resume_time=$(jq -r '.last_keyframe_pts' "$sidecar")
