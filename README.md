@@ -61,6 +61,7 @@ firefox-stream-fetch/
 | **mux 路径** | 新增 `mux_with_pts.py`（PyAV）：raw + pts → mp4/m4a，每帧写入真实 PTS；ffmpeg `-c copy` 合并保留双方 PTS 时间轴 |
 | **切集检测** | 三信号 OR：bidi-state / firefox URL 变化 / dump PTS 跳变；移除 ct/duration 启发式守卫 |
 | **Fallback 链** | PyAV 失败 → ffmpeg fps；解析失败 → ffprobe 探测 |
+| **StreamDumper 每帧 log** | 从每 100 帧节流改为无条件 log，便于调试 PTS 连续性 |
 
 ### v3.1.0 (2026-07-17)
 
