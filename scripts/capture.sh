@@ -499,6 +499,9 @@ user_pref("security.sandbox.gmp.level", 0);
 user_pref("security.sandbox.rdd.level", 0);
 user_pref("security.sandbox.socket.level", 0);
 user_pref("security.sandbox.utility.level", 0);
+// Phase 2 不恢复 session，避免重新打开 Phase 1 的 tabs
+user_pref("browser.startup.page", 0);
+user_pref("browser.sessionstore.resume_from_crash", false);
 EP
 
     clear_locks
@@ -627,11 +630,28 @@ mux_to_mp4() {
             echo "  ⚠️  H.264 清洗失败，回退到直接封装"
             cp "$dump" "$cleaned_h264"
         }
-        
-        # 探测帧率
-        local fps
-        fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$cleaned_h264" 2>/dev/null | head -1)
-        [ -z "$fps" ] && fps="25/1"
+
+        # 帧率检测：raw H.264 无可靠时间戳，ffprobe 探测常错。
+        # 优先用 sidecar.duration（视频元素实际时长）算 fps。
+        # fallback: ffprobe (raw h264 → 25/1)
+        local fps="25/1" frame_count=0 sidecar_dur=""
+        if [ -f "${base_arg}.sidecar.json" ] || [ -f "${dump%.h264}.sidecar.json" ]; then
+            local sc="${base_arg}.sidecar.json"
+            [ ! -f "$sc" ] && sc="${dump%.h264}.sidecar.json"
+            sidecar_dur=$(jq -r '.duration // empty' "$sc" 2>/dev/null)
+        fi
+        if [ -n "$sidecar_dur" ] && [ "$sidecar_dur" != "null" ] && [ "$sidecar_dur" != "0" ]; then
+            frame_count=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$cleaned_h264" 2>/dev/null)
+            if [ -n "$frame_count" ] && [ "$frame_count" -gt 0 ]; then
+                fps=$(awk -v f="$frame_count" -v d="$sidecar_dur" 'BEGIN{printf "%.4f", f/d}')
+                echo "  🎯 帧率修正: $frame_count 帧 / ${sidecar_dur}s = ${fps} fps (sidecar)"
+            fi
+        else
+            local probed
+            probed=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$cleaned_h264" 2>/dev/null | head -1)
+            [ -n "$probed" ] && fps="$probed"
+            echo "  ⚠️  无 sidecar.duration，ffprobe 探测 fps=$fps (可能不准)"
+        fi
         ffmpeg -y -fflags +genpts -r "$fps" -i "$cleaned_h264" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || {
             rm -f "$cleaned_h264"; return 1; }
         rm -f "$cleaned_h264"
