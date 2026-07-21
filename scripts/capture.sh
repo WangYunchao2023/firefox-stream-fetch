@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v3.0 统一入口
+# firefox-stream-fetch capture.sh — v3.2 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v3.0
+firefox-stream-fetch 统一抓取脚本 v3.2
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -314,7 +314,7 @@ phase1() {
     rm -rf "$PROFILE"
     mkdir -p "$PROFILE"
     cat > "$PROFILE/user.js" << 'PJEOF'
-// === v3.0 Phase 1 反指纹 prefs（实测通过 CF Turnstile） ===
+// === v3.2 Phase 1 反指纹 prefs（实测通过 CF Turnstile） ===
 user_pref("network.proxy.type", 5);
 user_pref("media.autoplay.default", 0);
 user_pref("browser.startup.page", 3);
@@ -602,81 +602,157 @@ EP
 # ═══════════════════════════════════════════════════════════════════════
 mux_to_mp4() {
     local dump="$1" audio="$2" out="$3" base_arg="${4:-}"
-    # base 默认 = dump 去 .h264（next_episode 时 dump 已是 .p1.h264，需要 OUT_BASE 真实 base 来算 parts）
     local base="${base_arg:-${dump%.h264}}"
 
     echo "🎬 封装 → $out"
 
-    # 检测多段
     local parts
     parts=$(ls "${base}".p*.h264 2>/dev/null | sort)
 
     local tmp_v="${out}.tmpv.mp4"
-    if [ -n "$parts" ]; then
-        echo "  (多段合并: $(echo "$parts" | wc -l) 段)"
-        local concat_file="${base}.concat.txt"
-        : > "$concat_file"
-        for p in $parts; do echo "file '$p'" >> "$concat_file"; done
-        ffmpeg -y -f concat -safe 0 -i "$concat_file" -c copy "$tmp_v" -loglevel error || {
-            rm -f "$concat_file"; return 1; }
-        rm -f "$concat_file"
-    elif [ -s "$dump" ]; then
-        # 先清洗 H.264 流：去除开头的垃圾帧（非 IDR、时间戳异常等）
-        # 使用 ffmpeg 的 h264_mp4toannexb + 重新封装来修复时间戳和 SPS/PPS
-        local cleaned_h264="${base}.cleaned.h264"
-        echo "  🧹 清洗 H.264 流（去除开头异常帧）..."
-        # 先转为 mp4 容器（ffmpeg 会自动处理 SPS/PPS 和时间戳），再导出为干净的 annex-b
-        ffmpeg -y -fflags +genpts+igndts -i "$dump" -c:v copy -f h264 "$cleaned_h264" -loglevel error 2>/dev/null || {
-            echo "  ⚠️  H.264 清洗失败，回退到直接封装"
-            cp "$dump" "$cleaned_h264"
-        }
+    local extractor="${SCRIPT_DIR}/sdfv_extract.py"
+    local muxer_py="${SCRIPT_DIR}/mux_with_pts.py"
+    local extracted_raw="${base}.raw"
+    local extracted_pts="${base}.pts"
+    local tmp_v_py="${out}.tmpv_py.mp4"  # PyAV 输出（保留原始 PTS）
 
-        # 帧率检测：raw H.264 无可靠时间戳，ffprobe 探测常错。
-        # 优先用 sidecar.duration（视频元素实际时长）算 fps。
-        # fallback: ffprobe (raw h264 → 25/1)
-        local fps="25/1" frame_count=0 sidecar_dur=""
-        if [ -f "${base_arg}.sidecar.json" ] || [ -f "${dump%.h264}.sidecar.json" ]; then
-            local sc="${base_arg}.sidecar.json"
-            [ ! -f "$sc" ] && sc="${dump%.h264}.sidecar.json"
-            sidecar_dur=$(jq -r '.duration // empty' "$sc" 2>/dev/null)
-        fi
-        if [ -n "$sidecar_dur" ] && [ "$sidecar_dur" != "null" ] && [ "$sidecar_dur" != "0" ]; then
-            frame_count=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$cleaned_h264" 2>/dev/null)
-            if [ -n "$frame_count" ] && [ "$frame_count" -gt 0 ]; then
-                fps=$(awk -v f="$frame_count" -v d="$sidecar_dur" 'BEGIN{printf "%.4f", f/d}')
-                echo "  🎯 帧率修正: $frame_count 帧 / ${sidecar_dur}s = ${fps} fps (sidecar)"
+    # 统一处理：解析 dump → .raw + .pts → 用 PyAV mux 成 mp4（保留 PTS）
+    # 这样无论单段/多段，mp4 内每帧 PTS 与 dump 一致。
+    if [ -n "$parts" ]; then
+        # 多段：依次解析每段，累加 PTS 偏移，拼接 raw + pts
+        echo "  (多段合并：$(echo "$parts" | wc -l) 段，按 PTS 拼接)"
+        : > "$extracted_raw"
+        : > "$extracted_pts"
+        local pts_offset=0
+        local last_pts=0
+        for p in $parts; do
+            echo "    📦 解析段：$p (pts_offset=${pts_offset}us)"
+            if python3 "$extractor" "$p" "$pts_offset" 2>&1 | tee /tmp/sdfv_seg.log; then
+                local seg_raw="${p%.h264}.raw"
+                local seg_pts="${p%.h264}.pts"
+                if [ -s "$seg_raw" ] && [ -s "$seg_pts" ]; then
+                    cat "$seg_raw" >> "$extracted_raw"
+                    cat "$seg_pts" >> "$extracted_pts"
+                    last_pts=$(tail -1 "$seg_pts")
+                    # 留 100ms 间隙避免 PTS 重叠
+                    pts_offset=$((last_pts + 100000))
+                else
+                    echo "    ⚠️  段解析失败：$p"
+                fi
+                rm -f "$seg_raw" "$seg_pts"
+            else
+                echo "    ⚠️  段解析器运行失败：$p"
             fi
-        else
-            local probed
-            probed=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$cleaned_h264" 2>/dev/null | head -1)
-            [ -n "$probed" ] && fps="$probed"
-            echo "  ⚠️  无 sidecar.duration，ffprobe 探测 fps=$fps (可能不准)"
+        done
+    elif [ -s "$dump" ]; then
+        # SDFV 格式：文件头 magic + SPS/PPS + 每帧 [size(4)][pts(8)][data]
+        echo "  📦 解析 SDFV dump + 提取每帧 PTS..."
+        if ! python3 "$extractor" "$dump" 2>&1 | tee /tmp/sdfv_extract.log; then
+            echo "  ⚠️  解析器运行失败，回退到 ffprobe 探测"
+            local fps
+            fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$dump" 2>/dev/null | head -1)
+            [ -z "$fps" ] && fps="25/1"
+            ffmpeg -y -fflags +genpts -r "$fps" -i "$dump" -c:v copy -movflags +faststart "$tmp_v" -loglevel error
+            rm -f "$extracted_raw" "$extracted_pts"
+            # 直接跳到音频合并
+            tmp_v_py="$tmp_v"  # 没有 PyAV 版本，用 ffmpeg 输出
         fi
-        ffmpeg -y -fflags +genpts -r "$fps" -i "$cleaned_h264" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || {
-            rm -f "$cleaned_h264"; return 1; }
-        rm -f "$cleaned_h264"
     fi
 
-    if [ ! -f "$tmp_v" ]; then
+    # 用 PyAV 封装（保留原始 PTS）
+    if [ -s "$extracted_pts" ] && [ -s "$extracted_raw" ]; then
+        local first_pts last_pts n_frames dur_s
+        first_pts=$(head -1 "$extracted_pts")
+        last_pts=$(tail -1 "$extracted_pts")
+        n_frames=$(wc -l < "$extracted_pts")
+        dur_s=$(awk -v a="$first_pts" -v b="$last_pts" 'BEGIN{printf "%.3f", (b-a)/1000000}')
+        echo "  ✅ PTS: $n_frames 帧，时长 ${dur_s}s, 首帧 PTS=${first_pts}us"
+
+        # PyAV 封装：每帧写入实际 PTS，保留与 dump 一致的时间轴
+        if python3 "$muxer_py" "$base" video 2>&1 | tee /tmp/mux_py.log; then
+            local py_v="${base}.mp4"
+            if [ -s "$py_v" ]; then
+                tmp_v_py="$py_v"
+                echo "  ✅ PyAV mux 成功（保留原始 PTS）"
+            else
+                echo "  ⚠️  PyAV 输出为空，回退到 ffmpeg fps"
+                local fps
+                fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+                ffmpeg -y -fflags +genpts -r "$fps" -i "$extracted_raw" \
+                    -c:v copy -movflags +faststart "$tmp_v" -loglevel error
+                tmp_v_py="$tmp_v"
+            fi
+        else
+            echo "  ⚠️  PyAV mux 失败，回退到 ffmpeg fps"
+            local fps
+            fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+            ffmpeg -y -fflags +genpts -r "$fps" -i "$extracted_raw" \
+                -c:v copy -movflags +faststart "$tmp_v" -loglevel error
+            tmp_v_py="$tmp_v"
+        fi
+    fi
+
+    rm -f "$extracted_raw" "$extracted_pts"
+
+    if [ ! -f "$tmp_v_py" ]; then
         echo "  ⚠️  无视频 dump，跳过封装"
         return 1
     fi
 
-    # 合并音频 —— 自动探测采样率/声道
+    # 合并音频 —— 用 PyAV 封装音频（保留 PTS），再用 ffmpeg -c copy 合并（保留双方 PTS）
     if [ -s "$audio" ]; then
-        local tmp_a="${out}.tmpa.m4a"
-        local ar ch
-        ar=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$audio" 2>/dev/null | head -1)
-        ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
-        [ -z "$ar" ] && ar="44100"
-        [ -z "$ch" ] && ch="2"
-        ffmpeg -y -i "$audio" -c:a copy "$tmp_a" -loglevel error || {
-            echo "  ⚠️  音频预处理失败，尝试直接合并"; ffmpeg -y -i "$tmp_v" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v" "$out"; return 1; }
-        } && ffmpeg -y -i "$tmp_v" -i "$tmp_a" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || {
-            echo "  ⚠️  音频合并失败，留视频轨"; mv "$tmp_v" "$out"; return 1; }
-        rm -f "$tmp_v" "$tmp_a"
+        local extracted_a_raw="${audio%.aac}.raw"
+        local extracted_a_pts="${audio%.aac}.pts"
+        local tmp_a_py="${audio%.aac}.m4a"
+
+        if python3 "$extractor" "$audio" >/dev/null 2>&1 && [ -s "$extracted_a_raw" ] && [ -s "$extracted_a_pts" ]; then
+            # PyAV 封装音频（保留 PTS）
+            if python3 "$muxer_py" "${audio%.aac}" audio 2>&1 | tee -a /tmp/mux_py.log; then
+                if [ -s "$tmp_a_py" ]; then
+                    echo "  ✅ PyAV 音频 mux 成功"
+                    # ffmpeg 合并两个 mp4，保留双方 PTS 时间轴
+                    local ar ch
+                    ar=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$tmp_a_py" 2>/dev/null | head -1)
+                    ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$tmp_a_py" 2>/dev/null | head -1)
+                    [ -z "$ar" ] && ar="44100"
+                    [ -z "$ch" ] && ch="2"
+                    ffmpeg -y -i "$tmp_v_py" -i "$tmp_a_py" \
+                        -c copy -map 0:v:0 -map 1:a:0 \
+                        -movflags +faststart "$out" -loglevel error || {
+                            echo "  ⚠️  PTS 合并失败，尝试默认合并"
+                            ffmpeg -y -i "$tmp_v_py" -i "$tmp_a_py" -c copy "$out" -loglevel error || {
+                                mv "$tmp_v_py" "$out"; return 1; }
+                        }
+                    rm -f "$tmp_v_py" "$tmp_a_py"
+                else
+                    echo "  ⚠️  PyAV 音频输出为空，回退"
+                    ffmpeg -y -i "$tmp_v_py" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+                fi
+            else
+                echo "  ⚠️  PyAV 音频 mux 失败，回退"
+                local ar ch
+                ar=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$audio" 2>/dev/null | head -1)
+                ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
+                [ -z "$ar" ] && ar="44100"
+                [ -z "$ch" ] && ch="2"
+                ffmpeg -y -ar "$ar" -ac "$ch" -i "$audio" -c:a copy "$tmp_a_py" -loglevel error || {
+                    ffmpeg -y -i "$tmp_v_py" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+                } && ffmpeg -y -i "$tmp_v_py" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+            fi
+        else
+            # fallback: 旧 ADTS 流
+            local ar ch
+            ar=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$audio" 2>/dev/null | head -1)
+            ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
+            [ -z "$ar" ] && ar="44100"
+            [ -z "$ch" ] && ch="2"
+            ffmpeg -y -ar "$ar" -ac "$ch" -i "$audio" -c:a copy "$tmp_a_py" -loglevel error || {
+                ffmpeg -y -i "$tmp_v_py" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+            } && ffmpeg -y -i "$tmp_v_py" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+        fi
+        rm -f "$extracted_a_raw" "$extracted_a_pts"
     else
-        mv "$tmp_v" "$out"
+        mv "$tmp_v_py" "$out"
     fi
 
     echo "  ✅ mp4: $out"
@@ -685,6 +761,8 @@ mux_to_mp4() {
         -of default=nw=1 "$out" 2>/dev/null | sed 's/^/    /' | head -8
 }
 
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 主循环
 # ═════════════════════════════════════════════════
@@ -692,7 +770,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v3.0                                ║"
+    echo "║  firefox-stream-fetch v3.2                                ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"

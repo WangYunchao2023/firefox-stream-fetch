@@ -50,9 +50,19 @@ firefox-stream-fetch/
 
 ## 版本记录
 
-### v3.1.0 (2026-07-17)
+### v3.2.0 (2026-07-21)
 
-**自动连集：每集独立 mp4、URL+src 双信号切集检测、顺序命名**
+**dump PTS 化 + PyAV mux + 切集检测升级**
+
+| 维度 | 内容 |
+|---|---|
+| **dump 格式** | 新格式 SDFV（视频）/ SDFA（音频）：文件头 magic + 每帧 [size(4)][pts_us(8)][data] |
+| **解析器** | `sdfv_extract.py`：dump → .raw + .pts；支持 `--last-pts-only` 快速读最后一帧 PTS |
+| **mux 路径** | 新增 `mux_with_pts.py`（PyAV）：raw + pts → mp4/m4a，每帧写入真实 PTS；ffmpeg `-c copy` 合并保留双方 PTS 时间轴 |
+| **切集检测** | 三信号 OR：bidi-state / firefox URL 变化 / dump PTS 跳变；移除 ct/duration 启发式守卫 |
+| **Fallback 链** | PyAV 失败 → ffmpeg fps；解析失败 → ffprobe 探测 |
+
+### v3.1.0 (2026-07-17)
 
 | 维度 | 内容 |
 |---|---|

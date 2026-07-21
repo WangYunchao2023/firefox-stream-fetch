@@ -21,3 +21,5 @@ dumps/
 # 日志 / 临时
 *.log
 *.tmp
+*.pyc
+__pycache__/

@@ -498,17 +498,19 @@ monitor_run() {
         fi
 
         # --- 检测下一集 ---
-        # 双信号触发（去重 + 优先取最早出现的那个）:
-        #   1. bidi-state 的 next_episode_url（同页面 SPA 内 playlist 切 src，window.__last_video_info 仍有效）
-        #   2. firefox URL 变化到另一个 URL（持久化在 sidecar.last_ff_url，跨 firefox URL 切换可靠）
+        # 三信号 OR 触发（任一满足即切集，不需要 ct/duration 守卫）:
+        #   1. bidi-state 的 next_episode_url（SPA 内 playlist 切 src，window.__last_video_info 仍有效）
+        #   2. firefox URL 变化到另一个真 URL（跨 firefox URL 切换可靠）
+        #   3. dump 文件 PTS 跳变（新帧 PTS < 上一帧 PTS，表示新视频开始）
         # StreamDumper sFile 是 firefox 进程内的 static fd，firefox 活着时 fd 一直写同一文件。
         # 如果不先 kill 就 mv，firefox 会把下一集内容写到 mv 后的 .p1.h264（同 inode）。
         local cur_ff_url
         cur_ff_url=$(echo "$query_out" | jq -r '.url // empty' 2>/dev/null)
         local last_ff_url
         last_ff_url=$(jq -r '.last_ff_url // empty' "$sidecar" 2>/dev/null)
+        local prev_pts_us
+        prev_pts_us=$(jq -r '.last_dump_pts_us // 0' "$sidecar" 2>/dev/null)
 
-        # 更新 last_ff_url 基线（firefox URL 跟基线不同时不算变化，因为可能 about: → 真 URL 是初始变化）
         local next_ep_url=""
         local next_ep_source=""
 
@@ -530,8 +532,6 @@ monitor_run() {
                     sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
                     ;;
                 *)
-                    # firefox URL 变化到真 URL（用户没传 URL 模式下，preheat 已经把 url 更新为 firefox 实际 url,
-                    # 所以 firefox URL 变化 = playlist 切到下一集）
                     if [ -z "$next_ep_url" ]; then
                         next_ep_url="$cur_ff_url"
                         next_ep_source="firefox-url"
@@ -541,20 +541,39 @@ monitor_run() {
                     ;;
             esac
         elif [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ]; then
-            # firefox URL 没变,只更新基线（首次写入或确认基线）
             sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
         fi
 
+        # 信号 3: PTS 跳变（dump 文件最后帧 PTS < 上一帧记录的 PTS）
+        # 不依赖 JS / BiDi，直接读 dump 文件最后一帧 PTS
+        local cur_pts_us=""
+        if [ -n "$dump_video" ] && [ -f "$dump_video" ]; then
+            cur_pts_us=$(python3 "${PROJECT_ROOT}/scripts/sdfv_extract.py" "$dump_video" --last-pts-only 2>/dev/null || echo "")
+        fi
+        if [ -z "$next_ep_url" ] && [ -n "$cur_pts_us" ] && [ "$cur_pts_us" != "0" ] && [ "$prev_pts_us" != "0" ]; then
+            # PTS 回跳（小于前一帧） = 新视频开始
+            if [ "$cur_pts_us" -lt "$prev_pts_us" ]; then
+                _monitor_log "⏭️  PTS 跳变检测到切集: ${prev_pts_us}us → ${cur_pts_us}us"
+                next_ep_url="$cur_ff_url"  # 续用当前 URL（SPA 切 src 同页面）
+                next_ep_source="pts-jump"
+            fi
+        fi
+        # 更新 last_pts（无论是否切集，下一轮比较用）
+        if [ -n "$cur_pts_us" ] && [ "$cur_pts_us" != "0" ]; then
+            sidecar_set "$sidecar" last_dump_pts_us "$cur_pts_us"
+        fi
+
+        # 触发切集（OR 三个信号，不再需要 ct/duration 守卫）
         if [ -n "$next_ep_url" ]; then
-            # 守卫：避免预加载/切清晰度误判（视频在播 + 时长足够）
-            # 同时守卫：如果视频已 ended（正常播放结束），不要当作 next_episode
-            local ct=${current_time:-0}
-            local dur=${duration:-0}
-            if [ "$(awk -v t="$ct" -v d="$dur" 'BEGIN{print (t > 30 && d > 60)}')" = "1" ]                && [ "$video_state" != "ended" ]; then
+            # 守卫：如果视频已 ended（正常播放结束），不要当作 next_episode
+            if [ "$video_state" = "ended" ]; then
+                _monitor_debug "⏭️  video_state=ended，走 ended 分支而非 next_episode ($next_ep_source)"
+            else
                 _monitor_log "⏭️  检测到下一集 ($next_ep_source): $next_ep_url"
                 sidecar_set "$sidecar" next_url "$next_ep_url"
                 sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
                 sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
+                sidecar_set "$sidecar" last_dump_pts_us "0"  # 重置，新集重新建立基线
 
                 # 先 kill firefox 释放 StreamDumper sFile fd，避免下一集内容污染当前集 dump
                 _monitor_log "   停止 firefox 准备滚动 dump..."
@@ -567,7 +586,6 @@ monitor_run() {
                 fi
 
                 # 手写 mv（不调 _monitor_roll_dump：它的 echo 是函数返回值，会污染 stdout 进而污染 monitor_run 返回的字符串）
-                # 用命名引用更新 dump_video / dump_audio 让末尾 echo 返回真实路径（base.p1.h264）
                 local _roll_base="${dump_video%.h264}"
                 if [ -f "$dump_video" ]; then
                     local _end_time
@@ -591,15 +609,8 @@ monitor_run() {
 
                 end_reason="next_episode"
                 break
-            else
-                _monitor_debug "⏭️  忽略 next_episode_url ($next_ep_source)（当前 ${ct}s,总 ${dur}s,疑为预加载/切清晰度）"
-                # 即使忽略也更新 last_ff_url，避免重复触发
-                if [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ]; then
-                    sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
-                fi
             fi
         fi
-
         # 更新 sidecar
         sidecar_set "$sidecar" video_state "\"$video_state\""
         sidecar_set "$sidecar" current_time "$current_time"

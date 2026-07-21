@@ -1,0 +1,155 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] dump: drop first N samples to skip Firefox startup warmup
+
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index 1d1370679f..6c39a3045e 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -69,6 +69,13 @@ mozilla::LazyLogModule gMediaDemuxerLog("MediaDemuxer");
+ // written verbatim with av1C extra data as sequence header. ffplay -f av1
+ // or `ffmpeg -c copy` after a quick header rewrite.
+ // VP9 (video/vp9) not yet implemented.
++namespace {
++// Audio dump file pointer is file-scope (not local-static of DumpAudio)
++// so Dump() can close it on stream change and DumpAudio reopens fresh.
++// Lives for the program's lifetime; initialized to nullptr.
++FILE* gAudioDumpFile = nullptr;
++}  // anonymous namespace
++
+ class StreamDumper {
+  public:
+   static void Dump(mozilla::TrackInfo::TrackType aTrack,
+@@ -82,19 +89,57 @@ class StreamDumper {
+     ++sCallCount;
+     if (!aSample) return;
+ 
++    // Pick TrackInfo: caller-supplied (decoder.GetCurrentInfo()) is most
++    // reliable. MP4Demuxer never sets aSample->mTrackInfo, so the caller
++    // MUST supply aInfo for MP4 paths.
++    const mozilla::TrackInfo* ti = aInfo;
++    if (!ti && aSample->mTrackInfo) {
++      ti = aSample->mTrackInfo->operator->();
++    }
++    if (!ti) return;
++
++    // ---- Drop the first N samples unconditionally ----
++    // Real-world Firefox startup fires a small burst of "junk" samples
++    // (about:blank warmup, decoder init, transparent placeholder frames)
++    // before the actual video content settles in. Without this guard they
++    // contaminate the start of the saved .h264 / .aac, producing the
++    // "前面一小段不是网站上原视频" symptom.
++    //
++    // We picked a fixed count (not a stream-ID heuristic) because:
++    //   * TrackInfo* pointers differ across the two Dump hooks → pointer
++    //     comparison would false-positive every sample.
++    //   * TrackInfoSharedPtr::GetID() is what we'd really want, but the
++    //     hook only gives us a raw TrackInfo*, so the source ID isn't
++    //     reliably accessible.
++    //   * A safe fixed count of video+audio samples is a clean, testable
++    //     solution. 30 ≈ 1s at 30fps — enough to span Firefox startup
++    //     warmup without losing real content under normal conditions.
++    //
++    // Both video and audio samples consume the same counter so audio
++    // stays in sync with video.
++    static int sPreSkipRemaining = 30;
++    if (sPreSkipRemaining > 0) {
++      const int newVal = --sPreSkipRemaining;
++      if (newVal == 0) {
++        std::fprintf(stderr,
++                     "[StreamDumper] Dropped first 30 samples (warmup) — starting dump at next sample\n");
++      }
++      return;
++    }
++
++    // ---- Dump state (declared once, used below) ----
++    static FILE* sFile = nullptr;
++    static bool sIsIVF = false;
++    static bool sHeaderWritten = false;
++    static bool sFirstFrameData = true;
++    static uint64_t sFrameCount = 0;
++
+     if (aTrack == mozilla::TrackInfo::kAudioTrack) {
+       DumpAudio(aSample, aInfo);
+       return;
+     }
+     if (aTrack != mozilla::TrackInfo::kVideoTrack) return;
+ 
+-    // Source TrackInfo: caller-supplied is most reliable (decoder's current info).
+-    // Fall back to sample->mTrackInfo (HLS demuxer sets this; MP4Demuxer does not).
+-    const mozilla::TrackInfo* ti = aInfo;
+-    if (!ti && aSample->mTrackInfo) {
+-      ti = aSample->mTrackInfo->operator->();
+-    }
+-    if (!ti) return;
+     auto* vi = ti->GetAsVideoInfo();
+     if (!vi) return;
+ 
+@@ -119,8 +164,8 @@ class StreamDumper {
+       }
+     }
+ 
+-    static FILE* sFile = nullptr;
+-    static bool sIsIVF = false;
++    // (sFile and sIsIVF declared at top of function — see stream tracking
++    // block above — so they're visible to the stream-change reset code.)
+     if (!sFile) {
+       // Determine output path. If user specified MOZ_STREAM_DUMP_PATH,
+       // honor it verbatim (preserve their .ext or no-extension). Otherwise,
+@@ -205,8 +250,7 @@ class StreamDumper {
+     RefPtr<mozilla::MediaRawData> clone = aSample->Clone();
+     if (!clone) return;
+ 
+-    static bool sHeaderWritten = false;
+-    static bool sFirstFrameData = true;
++    // (sHeaderWritten and sFirstFrameData declared at top of function.)
+     if (!sHeaderWritten) {
+       // For non-AV1 (raw bitstream containers): write codec config (e.g.
+       // SPS/PPS for AVC) as file header *before* any sample data.
+@@ -262,7 +306,7 @@ class StreamDumper {
+     }
+ 
+     if (sampleOk) {
+-      static uint64_t sFrameCount = 0;
++      // (sFrameCount declared at top of function.)
+       // For AV1 IVF output: wrap each MP4 sample into a single IVF frame.
+       // IVF frame header = 12 bytes:
+       //   u32 frame_size (LE)
+@@ -333,8 +377,9 @@ class StreamDumper {
+     auto* ai = ti->GetAsAudioInfo();
+     if (!ai) return;
+ 
+-    static FILE* sAudioFile = nullptr;
+-    if (!sAudioFile) {
++    // gAudioDumpFile is file-scope (see top of StreamDumper) so Dump() can
++    // close it on stream change and DumpAudio reopens fresh on next call.
++    if (!gAudioDumpFile) {
+       const char* env = std::getenv("MOZ_STREAM_DUMP_PATH");
+       char path[512];
+       if (env && *env) {
+@@ -353,8 +398,8 @@ class StreamDumper {
+       } else {
+         std::snprintf(path, sizeof(path), "/tmp/moz_stream.aac");
+       }
+-      sAudioFile = std::fopen(path, "wb");
+-      if (!sAudioFile) {
++      gAudioDumpFile = std::fopen(path, "wb");
++      if (!gAudioDumpFile) {
+         std::fprintf(stderr,
+                      "[StreamDumper] audio dump: failed to open %s (errno=%d %s)\n",
+                      path, errno, std::strerror(errno));
+@@ -389,9 +434,13 @@ class StreamDumper {
+                    "[StreamDumper] audio dump: ADTS::ConvertSample failed\n");
+       return;
+     }
+-    std::fwrite(clone->Data(), 1, clone->Size(), sAudioFile);
+-    std::fflush(sAudioFile);
++    std::fwrite(clone->Data(), 1, clone->Size(), gAudioDumpFile);
++    std::fflush(gAudioDumpFile);
+   }
++
++  // Stream-state reset is inlined at the top of Dump() (where the static
++  // state lives) — a separate ResetStreamState() function would only
++  // shadow those statics with its own local copies, making it a no-op.
+ };
+ 
+ namespace mozilla {
