@@ -584,9 +584,10 @@ monitor_run() {
         local size_v=0 size_a=0
         [ -f "$dump_video" ] && size_v=$(stat -c%s "$dump_video")
         [ -f "$dump_audio" ] && size_a=$(stat -c%s "$dump_audio")
+        local grew_v_bytes=0 grew_a_bytes=0
         local grew_v=0 grew_a=0
-        [ "$size_v" -gt "$last_size_v" ] && grew_v=1
-        [ "$size_a" -gt "$last_size_a" ] && grew_a=1
+        [ "$size_v" -gt "$last_size_v" ] && grew_v=1 && grew_v_bytes=$((size_v - last_size_v))
+        [ "$size_a" -gt "$last_size_a" ] && grew_a=1 && grew_a_bytes=$((size_a - last_size_a))
         sidecar_set "$sidecar" last_dump_size_video "$size_v"
         sidecar_set "$sidecar" last_dump_size_audio "$size_a"
         last_size_v=$size_v
@@ -621,7 +622,7 @@ monitor_run() {
                 ;;
             playing)
                 if [ $grew_v -eq 1 ] || [ $grew_a -eq 1 ]; then
-                    _monitor_log "▶  $current_time/$duration (v+$((size_v-last_size_v)) a+$((size_a-last_size_a)))"
+                    _monitor_log "▶  $current_time/$duration (v+$grew_v_bytes a+$grew_a_bytes)"
                     stall_count=0
                     state="playing"
                     local kpts
