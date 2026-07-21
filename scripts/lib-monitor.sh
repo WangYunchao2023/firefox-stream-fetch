@@ -151,7 +151,7 @@ _monitor_enable_dump_when_ready() {
             if [ "$ready_state" -ge 3 ] 2>/dev/null \
                 && [ "$(awk -v t="$current_time" 'BEGIN{print (t > 1)}')" = "1" ]; then
                 # 达到条件: 创建哨兵文件
-                if "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump 2>/dev/null; then
+                if "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump >/dev/null 2>&1; then
                     _monitor_log "   ✅ 门控启用 (readyState=$ready_state currentTime=$current_time state=$video_state) → StreamDumper 开始写 dump"
                     return 0
                 fi
@@ -633,7 +633,7 @@ monitor_run() {
                     # v3.3 fix: playing 但哨兵不存在 → 尝试创建哨兵启用 dump
                     if [ ! -f /tmp/firefox-stream-dump-enabled ]; then
                         _monitor_log "   ⏳ playing 但 dump 未启用，尝试创建哨兵..."
-                        "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump 2>/dev/null && \
+                        "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump >/dev/null 2>&1 && \
                             _monitor_log "   ✅ 哨兵创建成功 → StreamDumper 开始写 dump"
                     fi
                     stall_count=$((stall_count + 1))

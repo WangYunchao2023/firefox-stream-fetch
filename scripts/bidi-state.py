@@ -557,7 +557,7 @@ def main():
 
     p_call = sub.add_parser("call", help="unix socket 客户端：发送一条 JSON 命令")
     p_call.add_argument("--socket", required=True, help="daemon 的 unix socket 路径")
-    p_call.add_argument("--cmd", required=True, choices=["query", "seek", "ping", "stop"])
+    p_call.add_argument("--cmd", required=True, choices=["query", "seek", "ping", "stop", "enable_streamdump", "disable_streamdump"])
     p_call.add_argument("--seconds", type=float, help="seek 命令用")
     p_call.add_argument("--url-pattern", default=None)
     p_call.set_defaults(func=cmd_call)
