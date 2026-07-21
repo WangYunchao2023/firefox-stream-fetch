@@ -159,10 +159,17 @@ _monitor_wait_real_video() {
                     _monitor_debug "   preheat: CF challenge in progress ($url)"
                     ;;
                 http://*|https://*)
-                    # 真页面 URL,firefox 已经在目标域 → 预热完成
-                    # 新 firefox 启动时 StreamDumper 干净初始化,写真视频 SPS/PPS
-                    _monitor_log "   ✅ 真页面 ready: $url (ct=${cur}s dur=${dur}s ready=$ready)"
-                    return 0
+                    # 真页面 URL，进一步等待视频元素 ready + 正在播放
+                    # 关键：必须检查 state==playing，避免暂停态/未点击播放时误判 ready
+                    # 同时需要 readyState>=2 且有 duration/currentTime
+                    if [ "$ready" -ge 2 ] &&
+                       [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ] &&
+                       [ "$state" = "playing" ]; then
+                        _monitor_log "   ✅ 真视频 ready+playing: $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                        return 0
+                    fi
+                    _monitor_debug "   preheat: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"
                     ;;
                 *)
                     # 其他 URL（file:// 等），按 video metadata 兜底判定
@@ -180,6 +187,53 @@ _monitor_wait_real_video() {
         elapsed=$((elapsed + 2))
     done
     return 1
+}
+
+# 手工 URL 模式：无限等待 state=playing（不超时 fallback）
+# 用于 Phase 1 手工输入 URL 后，Phase 2 需等用户点击播放才开始抓取
+_monitor_wait_real_video_manual() {
+    while true; do
+        local q
+        q=$(_monitor_query 2>/dev/null)
+        if [ -n "$q" ]; then
+            local state ready cur dur url
+            state=$(echo "$q" | jq -r '.state // empty' 2>/dev/null)
+            ready=$(echo "$q" | jq -r '.readyState // 0' 2>/dev/null)
+            cur=$(echo "$q" | jq -r '.currentTime // 0' 2>/dev/null)
+            dur=$(echo "$q" | jq -r '.duration // 0' 2>/dev/null)
+            url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
+
+            case "$url" in
+                ""|about:*)
+                    _monitor_debug "   preheat-manual: waiting url=$url (用户尚未输入 URL 或 firefox 内部页)"
+                    ;;
+                *challenges.cloudflare.com*)
+                    _monitor_debug "   preheat-manual: CF challenge in progress ($url)"
+                    ;;
+                http://*|https://*)
+                    # 真页面 URL，等待 playing
+                    if [ "$ready" -ge 2 ] &&
+                       [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ] &&
+                       [ "$state" = "playing" ]; then
+                        _monitor_log "   ✅ 真视频 ready+playing: $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                        return 0
+                    fi
+                    _monitor_debug "   preheat-manual: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"
+                    ;;
+                *)
+                    if [ "$ready" -ge 3 ] && \
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>=2)?1:0}')" = "1" ] && \
+                       [ "$(awk -v d="$dur" 'BEGIN{print (d>30)?1:0}')" = "1" ]; then
+                        _monitor_log "   ✅ 真视频 ready (其他 url): $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                        return 0
+                    fi
+                    _monitor_debug "   preheat-manual: url=$url ready=$ready ct=${cur}s dur=${dur}s state=$state"
+                    ;;
+            esac
+        fi
+        sleep 2
+    done
 }
 
 # 通过 daemon 调用 seek
@@ -225,6 +279,7 @@ _monitor_roll_dump() {
 monitor_run() {
     local ff_bin="$1" profile="$2" url="$3"
     local dump_video="$4" dump_audio="$5" sidecar="$6"
+    local manual_url_mode="${7:-0}"
 
     local stall_count=0 paused_count=0 interrupt_count=0
     local last_size_v=0 last_size_a=0
@@ -263,13 +318,19 @@ monitor_run() {
     # 同时支持两种 URL 模式:
     #   - http(s): URL 已知,firefox 启动后等到真视频 ready 即 kill+restart
     #   - about:* (用户没传 URL,firefox 启动 about:home 等用户输入),firefox 启动后等到 URL=http(s) + 真视频 ready 才 kill+restart
+    #   - manual_url_mode=1 (Phase 1 手工 URL): 无限等待 state=playing,不超时 fallback
     local preheat_done=0
     local preheat_timeout=90
     if [[ "$url" == http://* || "$url" == https://* ]]; then
         preheat_timeout=60  # URL 已知,真视频 ready 应该 30s 内
     fi
 
-    _monitor_log "🔥 预热 firefox（dump 临时写 /dev/null，等真视频 ready 后重启, 超时 ${preheat_timeout}s）"
+    # 手工 URL 模式：无限等待 playing，不设超时 fallback
+    if [ "$manual_url_mode" = "1" ]; then
+        preheat_timeout=0  # 0 表示无限等待
+    fi
+
+    _monitor_log "🔥 预热 firefox（dump 临时写 /dev/null，等真视频 playing 后重启, 超时 ${preheat_timeout}s, 0=无限等待）"
     export MOZ_STREAM_DUMP_PATH="/dev/null"
 
     # 预热 firefox stdout/stderr 写到 LOG（这样 firefox 自己的错误信息能保留下来，便于排查）
@@ -281,23 +342,42 @@ monitor_run() {
     if _monitor_wait_for_bidi 30; then
         daemon_pid=$(_monitor_daemon_start)
         if _monitor_daemon_wait 15; then
-            if _monitor_wait_real_video "$preheat_timeout"; then
-                preheat_done=1
-                # 如果 url 是 about:*,从 firefox 拿到用户实际输入的 URL
-                if [[ "$url" == about:* ]]; then
+            if [ "$preheat_timeout" -eq 0 ]; then
+                # 手工模式：无限等待 playing
+                _monitor_log "   👆 手工 URL 模式：无限等待视频 playing..."
+                if _monitor_wait_real_video_manual; then
+                    preheat_done=1
+                    # 从 firefox 拿到用户实际 URL（可能与传入 url 不同，如重定向）
                     local q
                     q=$(_monitor_query 2>/dev/null)
                     if [ -n "$q" ]; then
                         local real_url
                         real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
                         if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
-                            _monitor_log "   ✅ 用户输入 URL: $real_url (原 url=$url)"
+                            _monitor_log "   ✅ 确认 URL: $real_url (原 url=$url)"
                             url="$real_url"
                         fi
                     fi
                 fi
             else
-                _monitor_log "   ⚠️  预热 ${preheat_timeout}s 未等到真视频 ready,继续主流程（dump 可能有污染）"
+                if _monitor_wait_real_video "$preheat_timeout"; then
+                    preheat_done=1
+                    # 如果 url 是 about:*,从 firefox 拿到用户实际输入的 URL
+                    if [[ "$url" == about:* ]]; then
+                        local q
+                        q=$(_monitor_query 2>/dev/null)
+                        if [ -n "$q" ]; then
+                            local real_url
+                            real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
+                            if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
+                                _monitor_log "   ✅ 用户输入 URL: $real_url (原 url=$url)"
+                                url="$real_url"
+                            fi
+                        fi
+                    fi
+                else
+                    _monitor_log "   ⚠️  预热 ${preheat_timeout}s 未等到真视频 ready,继续主流程（dump 可能有污染）"
+                fi
             fi
         else
             _monitor_log "   ⚠️  预热 daemon 未 ready,继续主流程"
@@ -466,9 +546,10 @@ monitor_run() {
 
         if [ -n "$next_ep_url" ]; then
             # 守卫：避免预加载/切清晰度误判（视频在播 + 时长足够）
+            # 同时守卫：如果视频已 ended（正常播放结束），不要当作 next_episode
             local ct=${current_time:-0}
             local dur=${duration:-0}
-            if [ "$(awk -v t="$ct" -v d="$dur" 'BEGIN{print (t > 30 && d > 60)}')" = "1" ]; then
+            if [ "$(awk -v t="$ct" -v d="$dur" 'BEGIN{print (t > 30 && d > 60)}')" = "1" ]                && [ "$video_state" != "ended" ]; then
                 _monitor_log "⏭️  检测到下一集 ($next_ep_source): $next_ep_url"
                 sidecar_set "$sidecar" next_url "$next_ep_url"
                 sidecar_set "$sidecar" episode_index "$((episode_index + 1))"

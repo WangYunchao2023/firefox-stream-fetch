@@ -379,11 +379,45 @@ PJEOF
                     "$title" != "about:home" &&
                     "$title" != "about:newtab" ]]; then
                 echo "  ✅ [$elapsed s] 检测到页面加载完成（标题: '$title'）"
-                # 给页面再 2s 让 MediaSource 进入 first segment
-                sleep 2
+                # 给页面再 5s 让 MediaSource 进入 first segment，sessionstore 同步记录最后访问的 URL
+                # 之前 sleeps 2s + 5s = 7s, 但 SIGTERM 后 xpcshell shutdown 异步同步 sessionstore.jsonlz4
+                # 偶尔 5s 不够，导致 _extract_phase1_url 拿不到 URL。
+                # 这里在 SIGTERM 之后再多等等到 sessionstore 出现 yfsp 类 URL 再继续。
+                sleep 5
                 echo "  🔪 关闭 Phase 1 Firefox（SIGTERM 保存 session/cookie）..."
                 kill -15 "$PID" 2>/dev/null || true
-                sleep 5
+                # 等待 sessionstore.jsonlz4 / .baklz4 出现最后的真 URL（包含 http(s)://）
+                # 最准同时机：firefox 退出会依次写 recovery.jsonlz4 包含未来恢复需要的最近访问的 URL
+                local session_wait=0
+                while [ "$session_wait" -lt 15 ]; do
+                    if [ -f "$PROFILE/sessionstore-backups/recovery.jsonlz4" ]; then
+                        local probe
+                        probe=$(python3 -c "
+import sys, json
+try:
+    import lz4.block
+    with open('$PROFILE/sessionstore-backups/recovery.jsonlz4', 'rb') as f:
+        raw = f.read()
+    data = lz4.block.decompress(raw[8:]) if raw.startswith(b'mozLz40\x00') else raw
+    d = json.loads(data)
+    for w in d.get('windows', []):
+        for t in w.get('tabs', []):
+            for e in t.get('entries', []):
+                u = e.get('url', '')
+                if u.startswith('http'):
+                    print(u); sys.exit(0)
+    sys.exit(1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null)
+                        if [ -n "$probe" ]; then
+                            echo "  📎 phase1 退出前 会话检测到 http URL=$probe"
+                            break
+                        fi
+                    fi
+                    sleep 1
+                    session_wait=$((session_wait + 1))
+                done
                 kill -9 "$PID" 2>/dev/null || true
 
                 # 等 cookies.sqlite 落盘
@@ -397,6 +431,13 @@ PJEOF
                         if [ "$cf_count" -gt 0 ]; then
                             echo "  ✅ Cookie 已落盘 ($cf_count 条 cf_clearance)"
                             clear_locks
+                            # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
+                            local phase1_url=""
+                            phase1_url=$(_extract_phase1_url "$PROFILE")
+                            if [ -n "$phase1_url" ]; then
+                                echo "$phase1_url" > "$PROFILE/.phase1_url"
+                                echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
+                            fi
                             return 0
                         fi
                     fi
@@ -413,6 +454,8 @@ PJEOF
                 if [ -n "$phase1_url" ]; then
                     echo "$phase1_url" > "$PROFILE/.phase1_url"
                     echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
+                else
+                    echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home"
                 fi
 
                 echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
@@ -491,12 +534,14 @@ EP
     # phase1 firefox 关闭后,我们解析 sessionstore 拿到用户实际访问的 URL,写到 $PROFILE/.phase1_url
     # phase2 自动续接,免去用户手动重输
     local PHASE2_URL=""
+    local MANUAL_URL_MODE=0
     if [ -n "${URL:-}" ]; then
         PHASE2_URL="$URL"
     elif [ -s "$PROFILE/.phase1_url" ]; then
         PHASE2_URL=$(cat "$PROFILE/.phase1_url" 2>/dev/null || true)
         if [ -n "$PHASE2_URL" ]; then
             echo "  📎 Phase2 URL 续接 Phase1: $PHASE2_URL"
+            MANUAL_URL_MODE=1
         fi
     fi
     PHASE2_URL="${PHASE2_URL:-about:home}"
@@ -506,13 +551,17 @@ EP
     echo "   URL: $PHASE2_URL"
     echo "   Profile: $PROFILE"
     echo "   详细日志: $LOG"
+    if [ $MANUAL_URL_MODE -eq 1 ]; then
+        echo "   🔧 手工 URL 模式：等待用户点击播放后再开始抓取"
+    fi
     echo ""
 
     # monitor_run 内部日志（_monitor_log 写 stderr）同时输出到终端 + 写 LOG,
     # 让用户能看 firefox 启动 / 预热 / 真 firefox 启动 / daemon ready 进度
+    # 传递 MANUAL_URL_MODE 给 monitor_run，手工模式下无限等待 playing
     local monitor_result
     monitor_result=$(monitor_run "$FF" "$PROFILE" "$PHASE2_URL" \
-        "$DUMP_FILE" "$AUDIO_DUMP" "$SIDECAR" 2> >(tee -a "$LOG" >&2))
+        "$DUMP_FILE" "$AUDIO_DUMP" "$SIDECAR" "$MANUAL_URL_MODE" 2> >(tee -a "$LOG" >&2))
 
     echo "$monitor_result"
     local reason interrupt final_video final_audio
@@ -546,7 +595,7 @@ EP
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# mp4 封装（含分段 concat + AAC 双轨）
+# mp4 封装（含分段 concat + AAC 双轨 + H.264 清洗）
 # ═══════════════════════════════════════════════════════════════════════
 mux_to_mp4() {
     local dump="$1" audio="$2" out="$3" base_arg="${4:-}"
@@ -569,11 +618,23 @@ mux_to_mp4() {
             rm -f "$concat_file"; return 1; }
         rm -f "$concat_file"
     elif [ -s "$dump" ]; then
-        # 自动探测帧率（从 SPS VUI 或解码前几帧估算）
+        # 先清洗 H.264 流：去除开头的垃圾帧（非 IDR、时间戳异常等）
+        # 使用 ffmpeg 的 h264_mp4toannexb + 重新封装来修复时间戳和 SPS/PPS
+        local cleaned_h264="${base}.cleaned.h264"
+        echo "  🧹 清洗 H.264 流（去除开头异常帧）..."
+        # 先转为 mp4 容器（ffmpeg 会自动处理 SPS/PPS 和时间戳），再导出为干净的 annex-b
+        ffmpeg -y -fflags +genpts+igndts -i "$dump" -c:v copy -f h264 "$cleaned_h264" -loglevel error 2>/dev/null || {
+            echo "  ⚠️  H.264 清洗失败，回退到直接封装"
+            cp "$dump" "$cleaned_h264"
+        }
+        
+        # 探测帧率
         local fps
-        fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$dump" 2>/dev/null | head -1)
+        fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of csv=p=0 "$cleaned_h264" 2>/dev/null | head -1)
         [ -z "$fps" ] && fps="25/1"
-        ffmpeg -y -fflags +genpts -r "$fps" -i "$dump" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || return 1
+        ffmpeg -y -fflags +genpts -r "$fps" -i "$cleaned_h264" -c:v copy -movflags +faststart "$tmp_v" -loglevel error || {
+            rm -f "$cleaned_h264"; return 1; }
+        rm -f "$cleaned_h264"
     fi
 
     if [ ! -f "$tmp_v" ]; then
