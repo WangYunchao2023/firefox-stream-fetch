@@ -630,6 +630,12 @@ monitor_run() {
                     sidecar_set "$sidecar" last_keyframe_pts "$kpts"
                 else
                     _monitor_log "▶  playing but no dump growth ($current_time)"
+                    # v3.3 fix: playing 但哨兵不存在 → 尝试创建哨兵启用 dump
+                    if [ ! -f /tmp/firefox-stream-dump-enabled ]; then
+                        _monitor_log "   ⏳ playing 但 dump 未启用，尝试创建哨兵..."
+                        "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump 2>/dev/null && \
+                            _monitor_log "   ✅ 哨兵创建成功 → StreamDumper 开始写 dump"
+                    fi
                     stall_count=$((stall_count + 1))
                     state="stalled"
                 fi
