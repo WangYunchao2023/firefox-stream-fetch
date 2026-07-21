@@ -62,6 +62,7 @@ _monitor_start_firefox() {
     setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
+        -no-session-restore \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
         -remote-allow-origins '*' \
         "$url" \
