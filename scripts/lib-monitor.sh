@@ -59,12 +59,23 @@ _monitor_start_firefox() {
                 ;;
         esac
     fi
+
+    # PHASE2_BOOTSTRAP_ONLY=1 → phase2 启动不传 URL（依赖 sessionrestore 自动恢复）
+    # 解决双 tab 问题（同时传入 yfsp URL + sessionrestore 已含 yfsp URL → 双 tab）
+    # 同时完整复用 phase1 的 cookie/storage/TLS,CF 大概率不再弹
+    local url_arg=()
+    if [ "${PHASE2_BOOTSTRAP_ONLY:-0}" = "1" ]; then
+        url_arg=()  # 完全依赖 sessionrestore 恢复的 tab
+    else
+        url_arg=("$url")
+    fi
+
     setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
         -remote-allow-origins '*' \
-        "$url" \
+        "${url_arg[@]}" \
         < /dev/null > "$firefox_log" 2>&1 &
     local pid=$!
     disown
@@ -129,39 +140,14 @@ _monitor_query() {
     "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd query 2>/dev/null
 }
 
-# v3.3 门控: 轮询 video 状态,达到 readyState>=3 + currentTime>1 后创建哨兵文件
-# StreamDumper C++ 检测哨兵后开始写 dump
+# v3.4 简化: 门控已删除 (StreamDumper 不再检查哨兵文件).
+# firefox 启动即开 dump. 启动阶段的 junk 帧会被 mux 阶段的
+# --rebase-at-first-keyframe 选项按首个 IDR 锚点重新对齐.
+# 这里保留 _monitor_enable_dump_when_ready 作为 deprecated stub 方便旧脚本调用不报错.
 _monitor_enable_dump_when_ready() {
     local timeout="${1:-90}"
-    local elapsed=0
-    local sentinel="/tmp/firefox-stream-dump-enabled"
-
-    # 清理可能残留的旧哨兵
-    rm -f "$sentinel"
-
-    _monitor_log "   ⏳ 等待 video.readyState>=3 + currentTime>1 后创建哨兵..."
-    while [ $elapsed -lt $timeout ]; do
-        local q
-        q=$(_monitor_query 2>/dev/null)
-        if [ -n "$q" ]; then
-            local ready_state current_time video_state
-            ready_state=$(echo "$q" | jq -r '.readyState // 0' 2>/dev/null)
-            current_time=$(echo "$q" | jq -r '.currentTime // 0' 2>/dev/null)
-            video_state=$(echo "$q" | jq -r '.state // "unknown"' 2>/dev/null)
-            if [ "$ready_state" -ge 3 ] 2>/dev/null \
-                && [ "$(awk -v t="$current_time" 'BEGIN{print (t > 1)}')" = "1" ]; then
-                # 达到条件: 创建哨兵文件
-                if "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump >/dev/null 2>&1; then
-                    _monitor_log "   ✅ 门控启用 (readyState=$ready_state currentTime=$current_time state=$video_state) → StreamDumper 开始写 dump"
-                    return 0
-                fi
-            fi
-        fi
-        sleep 2
-        elapsed=$((elapsed + 2))
-    done
-    _monitor_log "   ⚠️  ${timeout}s 未达到 video readyState>=3+currentTime>1, dump 未启用"
-    return 1
+    _monitor_log "   ⏩ v3.4 简化: 不再门控, firefox 启动即写 dump (junk 帧由 mux rebase 处理)"
+    return 0
 }
 
 # 等待真页面 ready（用于 firefox 预热阶段）
@@ -349,7 +335,7 @@ monitor_run() {
 
     # === v3.3 firefox 只启动一次（不预热）===
     # 设计: StreamDumper C++ 加哨兵门控。firefox 启动后不创建 dump 文件，
-    # BiDi 监控 video.readyState>=3 + currentTime>1，达到条件后创建哨兵文件，
+    # BiDi 监控 video.readyState>=2 + currentTime>0.5，达到条件后创建哨兵文件，
     # StreamDumper 才开始写真视频帧。避免了传统预热“杀 firefox 重启”的指纹变化问题。
     _monitor_log "🚀 启动 firefox（一次性启动,不再预热）"
     export MOZ_STREAM_DUMP_PATH="$dump_video"
@@ -360,7 +346,7 @@ monitor_run() {
     if _monitor_wait_for_bidi 30; then
         daemon_pid=$(_monitor_daemon_start)
         if _monitor_daemon_wait 15; then
-            # 手工 URL 模式: 等用户输入 URL + 页面 readyState>=3 + currentTime>1
+            # 手工 URL 模式: 等用户输入 URL + 页面 readyState>=2 + currentTime>0.5
             # URL 已知模式: 同样等真视频 ready
             # 全程使用 _monitor_enable_dump_when_ready (包含 readyState + currentTime 检测)
             _monitor_enable_dump_when_ready 120
@@ -416,9 +402,9 @@ monitor_run() {
             daemon_pid=$(_monitor_daemon_start)
             _monitor_daemon_wait 15 || true
 
-            # v3.3: firefox 重启后重新门控，删旧哨兵，等新哨兵
-            rm -f /tmp/firefox-stream-dump-enabled
-            _monitor_enable_dump_when_ready 120
+            # v3.4 简化: firefox 重启后不需要门控 (StreamDumper 立即写, mux rebase)
+            # 保留 _monitor_enable_dump_when_ready 调用作为 deprecated stub 以保持 ABI 兼容
+            _monitor_enable_dump_when_ready 120 2>/dev/null || true
 
             local resume_time
             resume_time=$(jq -r '.last_keyframe_pts' "$sidecar")
@@ -469,6 +455,13 @@ monitor_run() {
         local cur_ff_url
         cur_ff_url=$(echo "$query_out" | jq -r '.url // empty' 2>/dev/null)
         local last_ff_url
+        # CF 重弹检测（phase2 启动后 TLS 指纹变化偶尔触发）
+        if [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ] && echo "$cur_ff_url" | grep -q "challenges.cloudflare.com"; then
+            if [ "$video_state" != "playing" ]; then
+                _monitor_log "🛡️  CF 二次挑战中 (state=$video_state url=$cur_ff_url) - 请在 firefox 中过人机验证..."
+            fi
+        fi
+
         last_ff_url=$(jq -r '.last_ff_url // empty' "$sidecar" 2>/dev/null)
         local prev_pts_us
         prev_pts_us=$(jq -r '.last_dump_pts_us // 0' "$sidecar" 2>/dev/null)
@@ -485,6 +478,7 @@ monitor_run() {
         fi
 
         # 信号 2: firefox URL 变化（持久化在 sidecar，跨 firefox URL 切换可靠）
+        # 只有当 URL 路径变化（非查询参数）时才认为是下一集
         if [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ] && \
            [ "$cur_ff_url" != "$last_ff_url" ]; then
             case "$cur_ff_url" in
@@ -494,12 +488,15 @@ monitor_run() {
                     sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
                     ;;
                 *)
-                    if [ -z "$next_ep_url" ]; then
+                    # 规则: 任何 url 变化 = 切集 (path/query/hash 变化都算)
+                    # 例外: about:* → 真实 URL 的首次导航不算 (session restore 加载)
+                    if [[ "$last_ff_url" =~ ^about: ]]; then
+                        _monitor_debug "首次导航 about:* → 真实 URL,忽略 next_episode: $cur_ff_url"
+                    elif [ -z "$next_ep_url" ]; then
                         next_ep_url="$cur_ff_url"
                         next_ep_source="firefox-url"
-                    else
-                        _monitor_debug "bidi-state 与 firefox-url 都触发 next_episode,取 bidi-state:$next_ep_url"
                     fi
+                    sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
                     ;;
             esac
         elif [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ]; then
@@ -513,11 +510,38 @@ monitor_run() {
             cur_pts_us=$(python3 "${PROJECT_ROOT}/scripts/sdfv_extract.py" "$dump_video" --last-pts-only 2>/dev/null || echo "")
         fi
         if [ -z "$next_ep_url" ] && [ -n "$cur_pts_us" ] && [ "$cur_pts_us" != "0" ] && [ "$prev_pts_us" != "0" ]; then
-            # PTS 回跳（小于前一帧） = 新视频开始
-            if [ "$cur_pts_us" -lt "$prev_pts_us" ]; then
+            # PTS 回跳（小于前一帧）= 新视频开始
+            # 保护：dump 文件需 ≥ 50KB（粗略估算 ≈ 30+ 帧，避开冷启动 parse 错位）
+            # 保护：cur_pts_us 需 > 0 且 prev_pts_us 需正常范围（< 10^14 即 100 亿秒，正常视频几小时都不可能到这个量级）
+            local dump_size_bytes=0
+            if [ -n "$dump_video" ] && [ -f "$dump_video" ]; then
+                dump_size_bytes=$(stat -c%s "$dump_video" 2>/dev/null || echo 0)
+            fi
+            local pts_jump_armed=0
+            if [ "$dump_size_bytes" -ge 51200 ]; then
+                pts_jump_armed=1
+            fi
+
+            # 上限 = 当前视频 duration × 2（默认 1 小时视频上限 2 小时）
+            # 避免 last_pts 跨集残留的 10^13 量级（多集累积的奇怪值）误触 pts-jump
+            local pts_upper_us=3600000000   # 默认 1h 安全上限
+            if [ -n "$duration" ] && [ "$duration" != "null" ] && [ "$duration" != "" ] && [ "$duration" != "0" ]; then
+                # duration 是秒, 转换为 μs 再 × 2
+                pts_upper_us=$(awk -v d="$duration" 'BEGIN{printf "%d", d*1000000*2}')
+            fi
+
+            if [ $pts_jump_armed -eq 1 ] && \
+               [ "$cur_pts_us" -lt "$prev_pts_us" ] && \
+               [ "$prev_pts_us" -lt "$pts_upper_us" ] && \
+               [ "$cur_pts_us" -lt "$pts_upper_us" ] && \
+               [ "$prev_pts_us" -gt 0 ] && \
+               [ "$cur_pts_us" -gt 0 ]; then
                 _monitor_log "⏭️  PTS 跳变检测到切集: ${prev_pts_us}us → ${cur_pts_us}us"
                 next_ep_url="$cur_ff_url"  # 续用当前 URL（SPA 切 src 同页面）
                 next_ep_source="pts-jump"
+            elif [ "$cur_pts_us" -lt "$prev_pts_us" ]; then
+                # 异常值保护触发（上限外或文件太小）：只记录,不切集
+                _monitor_debug "PTS 异常值忽略: ${prev_pts_us}us → ${cur_pts_us}us (size=${dump_size_bytes}B upper=$pts_upper_us)"
             fi
         fi
         # 更新 last_pts（无论是否切集，下一轮比较用）
@@ -631,12 +655,8 @@ monitor_run() {
                     sidecar_set "$sidecar" last_keyframe_pts "$kpts"
                 else
                     _monitor_log "▶  playing but no dump growth ($current_time)"
-                    # v3.3 fix: playing 但哨兵不存在 → 尝试创建哨兵启用 dump
-                    if [ ! -f /tmp/firefox-stream-dump-enabled ]; then
-                        _monitor_log "   ⏳ playing 但 dump 未启用，尝试创建哨兵..."
-                        "$BIDI_STATE" call --socket "$BIDI_SOCKET" --cmd enable_streamdump >/dev/null 2>&1 && \
-                            _monitor_log "   ✅ 哨兵创建成功 → StreamDumper 开始写 dump"
-                    fi
+                    # v3.4 简化: 不再门控; streamdumper 启动即写
+                    # 这里只做 stall 计数, 不再尝试创建哨兵
                     stall_count=$((stall_count + 1))
                     state="stalled"
                 fi

@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v3.2 统一入口
+# firefox-stream-fetch capture.sh — v3.3 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v3.2
+firefox-stream-fetch 统一抓取脚本 v3.3
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -348,12 +348,14 @@ phase1() {
     rm -rf "$PROFILE"
     mkdir -p "$PROFILE"
     cat > "$PROFILE/user.js" << 'PJEOF'
-// === v3.2 Phase 1 反指纹 prefs（实测通过 CF Turnstile） ===
+// === v3.3 Phase 1 反指纹 prefs（实测通过 CF Turnstile） ===
 user_pref("network.proxy.type", 5);
 user_pref("media.autoplay.default", 0);
 user_pref("browser.startup.page", 3);
 user_pref("browser.sessionstore.resume_from_crash", true);
 user_pref("browser.sessionstore.max_resumed_crashes", 1);
+// sessionstore save interval: default 10000ms (10s), force to 2000ms (2s) for faster URL capture
+user_pref("browser.sessionstore.interval", 2000);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("browser.shell.skipDefaultBrowserCheckOnFirstRun", true);
 user_pref("browser.aboutwelcome.enabled", false);
@@ -423,7 +425,7 @@ PJEOF
                 # 等待 sessionstore.jsonlz4 / .baklz4 出现最后的真 URL（包含 http(s)://）
                 # 最准同时机：firefox 退出会依次写 recovery.jsonlz4 包含未来恢复需要的最近访问的 URL
                 local session_wait=0
-                while [ "$session_wait" -lt 15 ]; do
+                while [ "$session_wait" -lt 30 ]; do
                     if [ -f "$PROFILE/sessionstore-backups/recovery.jsonlz4" ]; then
                         local probe
                         probe=$(python3 -c "
@@ -472,7 +474,18 @@ except Exception:
                                 echo "$phase1_url" > "$PROFILE/.phase1_url"
                                 echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
                             else
-                                echo "  ⚠️  Sessionstore 10 次重试都拿不到 URL，phase2 将用 about:home + session restore"
+                                # Fallback: 从 places.sqlite 历史记录中拿最近访问的 http URL
+                                local fallback_url=""
+                                if [ -f "$PROFILE/places.sqlite" ]; then
+                                    fallback_url=$(sqlite3 "$PROFILE/places.sqlite" \
+                                        "SELECT url FROM moz_places WHERE visit_count > 0 AND url LIKE 'http%' AND url NOT LIKE '%about:%' ORDER BY last_visit_date DESC LIMIT 1" 2>/dev/null || echo "")
+                                fi
+                                if [ -n "$fallback_url" ]; then
+                                    echo "$fallback_url" > "$PROFILE/.phase1_url"
+                                    echo "  ✅ 从 places.sqlite 兜底拿到 URL: $fallback_url（phase2 自动续接）"
+                                else
+                                    echo "  ⚠️  Sessionstore + places.sqlite 都拿不到 URL，phase2 将用 about:home + session restore"
+                                fi
                             fi
                             return 0
                         fi
@@ -490,7 +503,18 @@ except Exception:
                     echo "$phase1_url" > "$PROFILE/.phase1_url"
                     echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
                 else
-                    echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home + session restore"
+                    # Fallback: places.sqlite 历史记录
+                    local fallback_url=""
+                    if [ -f "$PROFILE/places.sqlite" ]; then
+                        fallback_url=$(sqlite3 "$PROFILE/places.sqlite" \
+                            "SELECT url FROM moz_places WHERE visit_count > 0 AND url LIKE 'http%' AND url NOT LIKE '%about:%' ORDER BY last_visit_date DESC LIMIT 1" 2>/dev/null || echo "")
+                    fi
+                    if [ -n "$fallback_url" ]; then
+                        echo "$fallback_url" > "$PROFILE/.phase1_url"
+                        echo "  ✅ 从 places.sqlite 兜底拿到 URL: $fallback_url"
+                    else
+                        echo "  ⚠️  无法从 sessionstore / places.sqlite 提取 URL，phase2 将用 about:home + session restore"
+                    fi
                 fi
                 echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
                 return 0
@@ -546,8 +570,8 @@ EP
     local AUDIO_DUMP="${out_base}.aac"
     local SIDECAR="${out_base}.sidecar.json"
 
-    echo "📦 预定 dump (sentinel 启用后才创建): $DUMP_FILE"
-    echo "📦 预定 dump (sentinel 启用后才创建): $AUDIO_DUMP"
+    echo "📦 预定 dump (firefox 启动即开始写): $DUMP_FILE"
+    echo "📦 预定 dump (firefox 启动即开始写): $AUDIO_DUMP"
     echo "📋 Sidecar:    $SIDECAR"
     if has_proxy_env; then
         echo "🌐 代理: 环境变量 $(env | grep -iE '^(http|https|all|socks)_proxy=' | tr '\n' ' ')"
@@ -567,6 +591,15 @@ EP
     # 预热 firefox stdout/stderr 写到 $LOG（让 firefox 自己的错误信息能保留）
     export MOZ_LOG_FILE="$LOG"
 
+    # 修复双 tab 问题：phase2 启动 firefox 时不传 URL，让 sessionstore 自动恢复
+    # 之前 phase1 CF 通过 + 视频播放后，sessionstore 已记录最近 tab URL。
+    # phase2 复用同一 profile,启动时 cookie/storage/TLS 指纹完整保留。
+    # 若 phase2 又显式传入 URL（PHASE2_URL）→ 与 sessionrestore 同一 URL → 双 tab。
+    # 设 PHASE2_BOOTSTRAP_ONLY=1 让 monitor_run 跳过显式 URL，纯靠 sessionrestore。
+    # 这样 CF 大概率不再弹（cookie、IndexedDB、TLS 指纹均一致）。
+    # Phase 2 monitor 主循环会自动从 BiDi 读到 sessionrestore 加载的真实 URL。
+    export PHASE2_BOOTSTRAP_ONLY=1
+
     # Phase 2 URL 优先级：命令行 URL > phase1 URL（从 sessionstore 提取）> about:home
     # phase1 firefox 关闭后,我们解析 sessionstore 拿到用户实际访问的 URL,写到 $PROFILE/.phase1_url
     # phase2 自动续接,免去用户手动重输
@@ -574,14 +607,21 @@ EP
     local MANUAL_URL_MODE=0
     if [ -n "${URL:-}" ]; then
         PHASE2_URL="$URL"
+        unset PHASE2_BOOTSTRAP_ONLY  # 命令行显式 URL 时,仍传给 firefox
+        echo "  📎 命令行 URL 覆盖: $PHASE2_URL"
     elif [ -s "$PROFILE/.phase1_url" ]; then
         PHASE2_URL=$(cat "$PROFILE/.phase1_url" 2>/dev/null || true)
         if [ -n "$PHASE2_URL" ]; then
-            echo "  📎 Phase2 URL 续接 Phase1: $PHASE2_URL"
+            echo "  📎 Phase2 URL (从 .phase1_url 读): $PHASE2_URL"
+            # 但不传给 firefox（避免双 tab）,依赖 sessionrestore 自动恢复
+            PHASE2_URL_FOR_FIREFOX=""  # 空字符串 → monitor_run 用 sessionrestore
             MANUAL_URL_MODE=1
         fi
     fi
     PHASE2_URL="${PHASE2_URL:-about:home}"
+    # PHASE2_URL 给 monitor_run 用于查询和日志（保存最后 URL）
+    # 但 firefox 实际启动时不传 URL（除非命令行强制）
+    PHASE2_URL_FOR_FIREFOX="${PHASE2_URL}"
 
     # 明确告知用户 firefox 要启动（避免他们以为 phase2 卡住）
     echo "🚀 启动 Phase 2 Firefox..."
@@ -592,9 +632,8 @@ EP
         echo "   🔧 手工 URL 模式：等待用户点击播放后再开始抓取"
     fi
     echo ""
-    echo "   ⏳ firefox 启动后，StreamDumper 默认丢弃所有 sample"
-    echo "   ⏳ BiDi 监控 video.readyState>=3 + currentTime>1 后创建哨兵"
-    echo "   ⏳ StreamDumper 检测到哨兵才开始写真视频帧 (才创建 dump 文件)"
+    echo "   ⏳ v3.4 简化: firefox 启动后立即开始写 dump (无门控、无预热)"
+    echo "   ⏳ 启动阶段 junk 帧在 mux 时按 --rebase-at-first-keyframe 切齐"
     echo "   ⏳ 请在 firefox 中过 CF / 进入视频页面，不要 Ctrl+C 中断"
     echo ""
 
@@ -809,7 +848,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v3.2                                ║"
+    echo "║  firefox-stream-fetch v3.3                                ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"

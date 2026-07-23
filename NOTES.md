@@ -1,7 +1,7 @@
 # Stream-Fetch 实验笔记
 
 ## 项目目标
-在 Firefox **CDM 解密完成后、解码开始前**截获 H.264 NALU 流。
+在 Firefox **CDM 解密完成后、解码开始前**截获 H.264/HEVC/AV1 NALU 流。
 
 ## Hook 点选择
 
@@ -10,7 +10,7 @@
 |---|---|---|---|
 | 网络层 | NetworkObserver | DRM 解密**前** | CENC 加密段，不能用 |
 | MSE | SourceBuffer/TrackBuffers | 解密混合期 | 部分解密，部分加密 |
-| **MediaFormatReader** | HandleDemuxedSamples | **解密后、解码前** ✓ | **已解密的 H.264 NALU** |
+| **MediaFormatReader** | HandleDemuxedSamples | **解密后、解码前** ✓ | **已解密的 NALU/OBU** |
 | FFmpegVideoDecoder | CreateImage | 解码后 | YUV 像素（firefox-re 方案） |
 
 **选 MediaFormatReader::HandleDemuxedSamples** 作为最终 hook 点。
@@ -21,13 +21,40 @@
 
 **插入位置：** `HandleDemuxedSamples` 函数中 `DecodeDemuxedSamples(aTrack, sample)` 调用前
 
-**StreamDumper 类的功能：**
+**StreamDumper 类的功能演进：**
+
+### v1.0.0 (2026-07-11)
 1. 只处理视频轨 (`kVideoTrack`)
 2. 只处理 H.264 AVC (`video/avc` mime)
 3. 从 `MOZ_STREAM_DUMP_PATH` 环境变量读 dump 文件路径
 4. 第一次写 SPS/PPS header (用 `AnnexB::ConvertAVCCExtraDataToAnnexB`)
 5. 后续每个样本：转 AVCC → Annex B (用 `AnnexB::ConvertAVCCSampleToAnnexB`)
 6. 写入文件，附带 metadata (frame count, time, size)
+
+### v1.1.0 (2026-07-13) — AV1 + IVF
+- 新增 `video/av1` codec dispatch
+- AV1 sample 走 IVF 容器：32-byte file header + 每帧 12-byte frame header + OBU 字节流
+- 自动按 codec 选择后缀：`.h264` / `.h265` / `.av1`
+
+### v2.1.0 (2026-07-15) — 音频双轨
+- 新增 `kAudioTrack` 分支 → `DumpAudio()`
+- 用 Mozilla 自带 `ADTS::ConvertSample` 把 AAC 包成 ADTS 帧
+- 音频输出路径：`MOZ_STREAM_DUMP_PATH` 去掉视频扩展名后加 `.aac`
+
+### v3.2.0 (2026-07-21) — PTS dump
+- 每帧写入真实 PTS（微秒）：文件头 magic + 每帧 `[size(4)][pts_us(8)][data]`
+- 格式定名 SDFV (视频) / SDFA (音频)
+- 双 hook 点：`OnVideoDemuxCompleted` (MSE/EME) + `HandleDemuxedSamples` (MP4Demuxer)
+
+### v3.3.0 (2026-07-22) — **当前版本：哨兵门控 + 预热丢帧 + 三信号切集**
+- **哨兵门控**：C++ 端默认关闭 dump；每 50 视频帧 / 100 音频帧检查 `/tmp/firefox-stream-dump-enabled` 哨兵文件。BiDi 监控检测到 `video.readyState >= 3 && currentTime > 1` 后创建哨兵 → StreamDumper 开始写真帧。移除了旧版“预热 firefox → kill → 重启 Phase 2”的双启动指纹变更。
+- **预热丢帧**：C++ 端统一丢弃前 30 个 sample（视频+音频共享计数器），对应约 1s @ 30fps，覆盖 MSE/CDN 路径的 warmup junk frames（前 3-5 帧异常小帧）。
+- **三信号切集检测**（在 lib-monitor.sh / bidi-state.py）：
+  1. BiDi `next_episode_url`（SPA 切 src 同页面）
+  2. Firefox URL 变化（跨页面导航，持久化在 sidecar.last_ff_url）
+  3. dump PTS 跳变（新帧 PTS < 上一帧 PTS，纯文件层面）
+- **每帧 log**：从每 100 帧节流改为无条件 log，便于调试 PTS 连续性。
+- **Phase 1/2 合并**：单次 Firefox 启动，无需 kill/resume。
 
 ## 编译过程
 
@@ -80,7 +107,7 @@ Mozilla 用 Unified_cpp_dom_media*.cpp 把多个 .cpp 合并编译。文件被 `
    - 结果：日志里 **0 条 StreamDumper 调用** —— hook 完全不触发
 3. **加第二个 hook 点**: `HandleDemuxedSamples` 里的 `DecodeDemuxedSamples` 之前
    - 结果：dump 头几个 NALU 出现，但 `!info` early-return —— **aSample->mTrackInfo 是 null**
-4. **根因**: MP4Demuxer 的 `GetNextSample()` 从不解码器侧设置 mTrackInfo
+4. **根因**: MP4Demuxer 的 `GetNextSample()` 从不从解码器侧设置 mTrackInfo
    - 只设了 mExtraData 和 mKeyframe（[MP4Demuxer.cpp:407](firefox/dom/media/mp4/MP4Demuxer.cpp#L407)）
    - HLSDemuxer / TrackBuffersManager / MediaChangeMonitor 都设，**唯独 MP4Demuxer 不设**
 5. **修复**: StreamDumper 接受可选 `const TrackInfo* aInfo` 参数
@@ -123,6 +150,11 @@ Mozilla 用 Unified_cpp_dom_media*.cpp 把多个 .cpp 合并编译。文件被 `
 - `obj-stream/dist/bin/libxul.so` (3.4GB, 16+ 处 StreamDumper 符号)
 - `obj-stream/dist/bin/widevine/libwidevinecdm.so` (21MB, 从 Chrome 抠出)
 - `patches/0001-dump-stream.patch` (含 StreamDumper 类 + 双 hook 点)
+- `patches/0002-add-av1-support.patch`
+- `patches/0003-codec-aware-output.patch`
+- `patches/0004-add-audio-dump.patch`
+- `patches/0005-stream-source-tracking.patch` (v3.3 哨兵门控 + 预热丢帧)
+- `patches/0006-streamdumper-dump-gate.patch` (v3.3 哨兵门控)
 - `scripts/verify-stream.sh` (验证脚本)
 - `scripts/check-video.py` + `tmp/bidi-full.py` (BiDi 诊断)
 

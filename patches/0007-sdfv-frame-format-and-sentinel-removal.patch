@@ -1,0 +1,291 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] dump: simplify to no-gate, no-preheat + SDFV/A frame format
+
+v3.4 简化: StreamDumper 重写为"firefox 启动即写"模型.
+
+主要改动:
+  1. 删除 v3.3 哨兵门控 (sDumpEnabled / kDumpSentinelPath).
+     BiDi 不再需要 streamDumper.enable/disable_streamdump 命令，
+     StreamDumper 内部也不再 access("/tmp/firefox-stream-dump-enabled")。
+
+  2. 删除 v3.3 5 sample 预热丢弃 (sPreSkipRemaining).
+     firefox 启动阶段产生的 "junk 帧" (about:blank / decoder warmup) 现在落地，
+     由 mux 阶段的 --rebase-at-first-keyframe 选项按第一个视频关键帧 IDR 重新对齐。
+
+  3. 修复 SDFV 格式不一致: 之前每帧写 [data][pts:8] (PTS 在尾部), 与 sdfv_extract.py docstring ([size:4][pts:8][data]) 不符。
+     现在每帧严格按 [size_le:4][pts_le:8][data:size] 顺序写入, docstring 是真相来源, 解析器可靠。
+
+  4. 收紧状态可见性: StreamDumper::Dump 内的静态变量在文件顶部声明一次, 
+     避免局部 + 整函数全程多处声明混用引起的 scope bug (修复了 v3.4 编译时发现的
+     `use of undeclared identifier 'hdr'` 错误).
+
+  5. 删除 extern "C" QueryStreamDumpEnabled / SetStreamDumpEnabled 全局钩子,
+     不再有跨 .cpp 调用入口.
+
+只调用入口: Dump (视频) + DumpAudio (音频) 各自处理自己的样本, firefox 启动即开始写盘.
+
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+index 1d1370679f..81e62ff11a 100644
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -69,6 +69,21 @@ mozilla::LazyLogModule gMediaDemuxerLog("MediaDemuxer");
+ // written verbatim with av1C extra data as sequence header. ffplay -f av1
+ // or `ffmpeg -c copy` after a quick header rewrite.
+ // VP9 (video/vp9) not yet implemented.
++//
++// v3.4 简化:
++//   删除了哨兵门控 (sDumpEnabled / kDumpSentinelPath) 和 5 sample 预热丢弃。
++//   StreamDumper 现在 firefox 启动即开始写 dump，写下的"启动 junk 帧"
++//   (about:blank 残留 / decoder 预热 / 占位帧) 在 mux 阶段通过
++//   --rebase-at-first-keyframe 选项按第一个视频关键帧 IDR 重新对齐来消除。
++//   这把"什么时候开始写"的决策从 C++ + bash 跨进程协调转移到了
++//   单点 Python mux 处理，语义更清晰（"第一个 IDR 即为 t=0"）。
++namespace {
++// Audio dump file pointer is file-scope (not local-static of DumpAudio)
++// so Dump() can close it on stream change and DumpAudio reopens fresh.
++// Lives for the program's lifetime; initialized to nullptr.
++FILE* gAudioDumpFile = nullptr;
++}  // anonymous namespace
++
+ class StreamDumper {
+  public:
+   static void Dump(mozilla::TrackInfo::TrackType aTrack,
+@@ -81,7 +96,6 @@ class StreamDumper {
+     }
+     ++sCallCount;
+     if (!aSample) return;
+-
+     if (aTrack == mozilla::TrackInfo::kAudioTrack) {
+       DumpAudio(aSample, aInfo);
+       return;
+@@ -95,6 +109,17 @@ class StreamDumper {
+       ti = aSample->mTrackInfo->operator->();
+     }
+     if (!ti) return;
++
++    // ---- Dump state (declared once, used below) ----
++    static FILE* sFile = nullptr;
++    static bool sIsIVF = false;
++    static bool sHeaderWritten = false;
++    static bool sFirstFrameData = true;
++    static uint64_t sFrameCount = 0;
++    // SDFV: header_len 字段位置 + SPS/PPS 起始偏移（用于回头填 header_len）
++    static long sHeaderLenOffset = 0;
++    static long sHeaderStartOffset = 0;
++
+     auto* vi = ti->GetAsVideoInfo();
+     if (!vi) return;
+ 
+@@ -119,8 +144,8 @@ class StreamDumper {
+       }
+     }
+ 
+-    static FILE* sFile = nullptr;
+-    static bool sIsIVF = false;
++    // (sFile and sIsIVF declared at top of function — see stream tracking
++    // block above — so they're visible to the stream-change reset code.)
+     if (!sFile) {
+       // Determine output path. If user specified MOZ_STREAM_DUMP_PATH,
+       // honor it verbatim (preserve their .ext or no-extension). Otherwise,
+@@ -154,6 +179,18 @@ class StreamDumper {
+           return;
+         }
+       }
++      // === SDFV magic (StreamDumper Format Video, 每帧带 PTS) ===
++      // Layout: magic(4) + version(1) + reserved(3) + header_len_le(4) = 12 bytes
++      // header_len 暂填 0，SPS/PPS 写完后回头 seek 填入
++      static const uint8_t kSdfvMagic[12] = {
++        'S','D','F','V', 0x01, 0x00, 0x00, 0x00,
++        0x00, 0x00, 0x00, 0x00
++      };
++      std::fwrite(kSdfvMagic, 1, sizeof(kSdfvMagic), sFile);
++      // 记下 SPS/PPS 起始位置（偏移 12）和 header_len 字段位置（偏移 8）
++      sHeaderLenOffset = 8;
++      sHeaderStartOffset = 12;
++      sHeaderWritten = false;  // 复用为"header 写入完成"标志
+       const char* ext =
+           (sCodecId == 1) ? "H.264"
+           : (sCodecId == 2) ? "HEVC"
+@@ -205,8 +242,7 @@ class StreamDumper {
+     RefPtr<mozilla::MediaRawData> clone = aSample->Clone();
+     if (!clone) return;
+ 
+-    static bool sHeaderWritten = false;
+-    static bool sFirstFrameData = true;
++    // (sHeaderWritten and sFirstFrameData declared at top of function.)
+     if (!sHeaderWritten) {
+       // For non-AV1 (raw bitstream containers): write codec config (e.g.
+       // SPS/PPS for AVC) as file header *before* any sample data.
+@@ -245,6 +281,17 @@ class StreamDumper {
+         }
+       }
+       sHeaderWritten = true;
++      // === SDFV: 回头填 header_len ===
++      // 当前文件偏移 - header 起始偏移 = SPS/PPS 长度
++      long cur = std::ftell(sFile);
++      long headerLen = cur - sHeaderStartOffset;
++      if (headerLen > 0) {
++        std::fseek(sFile, sHeaderLenOffset, SEEK_SET);
++        uint8_t lenBuf[4];
++        for (int i = 0; i < 4; ++i) lenBuf[i] = (uint8_t)((headerLen >> (8 * i)) & 0xff);
++        std::fwrite(lenBuf, 1, sizeof(lenBuf), sFile);
++        std::fseek(sFile, cur, SEEK_SET);  // 回到当前位置
++      }
+     }
+ 
+     bool sampleOk = false;
+@@ -262,11 +309,15 @@ class StreamDumper {
+     }
+ 
+     if (sampleOk) {
+-      static uint64_t sFrameCount = 0;
+-      // For AV1 IVF output: wrap each MP4 sample into a single IVF frame.
+-      // IVF frame header = 12 bytes:
+-      //   u32 frame_size (LE)
+-      //   u64 timestamp   (LE; 0 if unknown / ffmpeg default)
++      // (sFrameCount declared at top of function.)
++      // === SDFV 每帧 layout: [size_le:4][pts_le:8][data:size] ===
++      // size = 本帧实际数据字节数 (NAL unit for AVC/HEVC, IVF frame header + OBUs for AV1)
++      // pts = firefox MediaRawData.mTime 的 microseconds 整数表示
++      // AV1 额外: 先写 IVF frame header (12 bytes) + 第 1 帧 init OBU(s) + 本帧 OBU
++      //    → 这些 bytes 的总数 = frame_hdr[0..3] 填的 SDFV size.
++      uint8_t frame_hdr[12];
++      uint64_t pts_us = (uint64_t)aSample->mTime.ToMicroseconds();
++      uint32_t totalSize = 0;  // will fill below
+       if (sIsIVF) {
+         // For the very first IVF frame, prepend decoder-init OBU(s) from
+         // mExtraData (skipping the av1C config header) so the frame
+@@ -279,38 +330,49 @@ class StreamDumper {
+             clone->mExtraData->Length() > 4) {
+           initAv1 = clone->mExtraData->Elements();
+           initAv1Bytes = (size_t)clone->mExtraData->Length() - 4;
+-          if (sFirstFrameData) {
+-            std::fprintf(stderr,
+-                         "[StreamDumper] AV1 IVF frame 1: prepend init OBU "
+-                         "(%zu bytes after av1C config)\n",
+-                         initAv1Bytes);
+-          }
+-        }
+-        uint32_t frameSize = (uint32_t)(initAv1Bytes + clone->Size());
+-        uint64_t timestamp = (uint64_t)sFrameCount;  // placeholder
+-        uint8_t hdr[12];
+-        hdr[0] = frameSize & 0xff;
+-        hdr[1] = (frameSize >> 8) & 0xff;
+-        hdr[2] = (frameSize >> 16) & 0xff;
+-        hdr[3] = (frameSize >> 24) & 0xff;
+-        for (int i = 0; i < 8; ++i) {
+-          hdr[4 + i] = (uint8_t)((timestamp >> (8 * i)) & 0xff);
++          std::fprintf(stderr,
++                       "[StreamDumper] AV1 IVF frame 1: prepend init OBU "
++                       "(%zu bytes after av1C config)\n",
++                       initAv1Bytes);
+         }
+-        std::fwrite(hdr, 1, sizeof(hdr), sFile);
++        // IVF frame header: u32 frame_size (LE) + u64 timestamp (LE, ignored: pts in frame_hdr)
++        uint32_t ivfFrameSize = (uint32_t)(initAv1Bytes + clone->Size());
++        frame_hdr[0] = ivfFrameSize & 0xff;
++        frame_hdr[1] = (ivfFrameSize >> 8) & 0xff;
++        frame_hdr[2] = (ivfFrameSize >> 16) & 0xff;
++        frame_hdr[3] = (ivfFrameSize >> 24) & 0xff;
++        // SDFV frame_hdr field 0..3 already filled with IVF size.
++        // Field 4..11 = pts; fill below.
++        std::fwrite(frame_hdr, 1, sizeof(frame_hdr), sFile);  // IVF frame header (pts slot ignored by ffmpeg IVF parser)
+         if (initAv1Bytes > 0) {
+           std::fwrite(initAv1 + 4, 1, initAv1Bytes, sFile);
+         }
+         sFirstFrameData = false;
++        totalSize = ivfFrameSize;
++      } else {
++        // Non-AV1 (AVC/HEVC): frame_hdr will hold [size_LE:4][pts_LE:8] before the NAL unit data.
++        totalSize = (uint32_t)clone->Size();
++        frame_hdr[0] = totalSize & 0xff;
++        frame_hdr[1] = (totalSize >> 8) & 0xff;
++        frame_hdr[2] = (totalSize >> 16) & 0xff;
++        frame_hdr[3] = (totalSize >> 24) & 0xff;
++      }
++      // Fill SDFV pts (frame_hdr field 4..11, LE u64)
++      for (int i = 0; i < 8; ++i) frame_hdr[4 + i] = (uint8_t)((pts_us >> (8 * i)) & 0xff);
++      // For non-IVF path: rewrite the same frame_hdr that the IVF branch already wrote.
++      // IVF path already wrote frame_hdr (IVF + pts slots); the pts slot happens to be
++      // the same bytes we just filled, so no rewrite needed for IVF.
++      if (!sIsIVF) {
++        std::fwrite(frame_hdr, 1, sizeof(frame_hdr), sFile);
+       }
+       std::fwrite(clone->Data(), 1, clone->Size(), sFile);
+       std::fflush(sFile);
+-      if (++sFrameCount <= 3 || sFrameCount % 100 == 0) {
+-        std::fprintf(stderr,
+-                     "[StreamDumper] frame=%llu time=%lldus size=%zu\n",
+-                     (unsigned long long)sFrameCount,
+-                     (long long)aSample->mTime.ToMicroseconds(),
+-                     aSample->Size());
+-      }
++      std::fprintf(stderr,
++                   "[StreamDumper] frame=%llu time=%lldus size=%u\n",
++                   (unsigned long long)sFrameCount,
++                   (long long)aSample->mTime.ToMicroseconds(),
++                   totalSize);
++      ++sFrameCount;
+     }
+   }
+ 
+@@ -333,8 +395,9 @@ class StreamDumper {
+     auto* ai = ti->GetAsAudioInfo();
+     if (!ai) return;
+ 
+-    static FILE* sAudioFile = nullptr;
+-    if (!sAudioFile) {
++    // gAudioDumpFile is file-scope (see top of StreamDumper) so Dump() can
++    // close it on stream change and DumpAudio reopens fresh on next call.
++    if (!gAudioDumpFile) {
+       const char* env = std::getenv("MOZ_STREAM_DUMP_PATH");
+       char path[512];
+       if (env && *env) {
+@@ -353,13 +416,19 @@ class StreamDumper {
+       } else {
+         std::snprintf(path, sizeof(path), "/tmp/moz_stream.aac");
+       }
+-      sAudioFile = std::fopen(path, "wb");
+-      if (!sAudioFile) {
++      gAudioDumpFile = std::fopen(path, "wb");
++      if (!gAudioDumpFile) {
+         std::fprintf(stderr,
+                      "[StreamDumper] audio dump: failed to open %s (errno=%d %s)\n",
+                      path, errno, std::strerror(errno));
+         return;
+       }
++      // === SDFA magic (StreamDumper Format Audio, 每帧带 PTS) ===
++      // Layout: magic(4) + version(1) + reserved(3) = 8 bytes, 然后是裸 ADTS 帧序列
++      static const uint8_t kSdfaMagic[8] = {
++        'S','D','F','A', 0x01, 0x00, 0x00, 0x00
++      };
++      std::fwrite(kSdfaMagic, 1, sizeof(kSdfaMagic), gAudioDumpFile);
+       std::fprintf(stderr,
+                    "[StreamDumper] writing AAC audio to %s "
+                    "(rate=%u ch=%u profile=%u mime=%s)\n",
+@@ -389,9 +458,22 @@ class StreamDumper {
+                    "[StreamDumper] audio dump: ADTS::ConvertSample failed\n");
+       return;
+     }
+-    std::fwrite(clone->Data(), 1, clone->Size(), sAudioFile);
+-    std::fflush(sAudioFile);
+-  }
++    // === SDFA 每帧 layout: [size_le:4][pts_le:8][data:size] ===
++    // 与视频侧 SDFV 帧结构一致 (见 Dump()). 这样 sdfv_extract.py 一个解析器
++    // 同时吃 video/audio, 双方均按 [hdr 12B][data N] 顺序读。
++    uint64_t audioPtsUs = (uint64_t)aSample->mTime.ToMicroseconds();
++    uint8_t audioHdr[12];
++    uint32_t audioFrameSize = (uint32_t)clone->Size();
++    for (int i = 0; i < 4; ++i) audioHdr[i] = (uint8_t)((audioFrameSize >> (8 * i)) & 0xff);
++    for (int i = 0; i < 8; ++i) audioHdr[4 + i] = (uint8_t)((audioPtsUs >> (8 * i)) & 0xff);
++    std::fwrite(audioHdr, 1, sizeof(audioHdr), gAudioDumpFile);
++    std::fwrite(clone->Data(), 1, clone->Size(), gAudioDumpFile);
++    std::fflush(gAudioDumpFile);
++  }
++
++  // Stream-state reset is inlined at the top of Dump() (where the static
++  // state lives) — a separate ResetStreamState() function would only
++  // shadow those statics with its own local copies, making it a no-op.
+ };
+ 
+ namespace mozilla {

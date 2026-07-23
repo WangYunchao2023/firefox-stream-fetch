@@ -38,10 +38,10 @@ def _build_query_fn(video_selector=None):
         # Custom selector provided
         selector_js = f"document.querySelector('{video_selector}')"
     elif video_selector == 'auto' or video_selector is None:
-        # Smart detection: try multiple strategies
+        # Smart detection: try multiple strategies (relaxed conditions)
         selector_js = """
 (function() {
-  // Strategy 1: Try common player selectors
+  // Strategy 1: Try common player selectors (relaxed: allow duration >= 0 or readyState >= 2)
   const selectors = [
     '#dplayer video',
     '.dplayer-video video',
@@ -50,10 +50,12 @@ def _build_query_fn(video_selector=None):
     '.player video',
     '[id*="player"] video',
     '[class*="player"] video',
+    'video[id*="player"]',
+    'video[class*="player"]',
   ];
   for (const sel of selectors) {
     const v = document.querySelector(sel);
-    if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
+    if (v && (v.duration > 0 || v.readyState >= 2)) return v;
   }
   
   // Strategy 2: Check iframes (same-origin only)
@@ -63,7 +65,7 @@ def _build_query_fn(video_selector=None):
       const doc = iframe.contentDocument || iframe.contentWindow.document;
       if (doc) {
         const v = doc.querySelector('video');
-        if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
+        if (v && (v.duration > 0 || v.readyState >= 2)) return v;
       }
     } catch (e) {}
   }
@@ -71,7 +73,7 @@ def _build_query_fn(video_selector=None):
   // Strategy 3: Check shadow DOM
   function findInShadow(root) {
     const v = root.querySelector('video');
-    if (v && v.duration && isFinite(v.duration) && v.duration > 2) return v;
+    if (v && (v.duration > 0 || v.readyState >= 2)) return v;
     for (const el of root.querySelectorAll('*')) {
       if (el.shadowRoot) {
         const found = findInShadow(el.shadowRoot);
@@ -83,7 +85,7 @@ def _build_query_fn(video_selector=None):
   const shadowV = findInShadow(document);
   if (shadowV) return shadowV;
   
-  // Strategy 4: Find video with longest duration > 2s
+  // Strategy 4: Find video with longest duration, or any video with readyState >= 2
   const videos = document.querySelectorAll('video');
   let best = null;
   let bestDur = 0;
@@ -93,7 +95,12 @@ def _build_query_fn(video_selector=None):
       best = v;
     }
   }
-  if (best && bestDur > 2) return best;
+  if (best && bestDur > 0) return best;
+  
+  // Strategy 5: Any video with readyState >= 1 (HAVE_METADATA)
+  for (const v of videos) {
+    if (v.readyState >= 1) return v;
+  }
   
   // Fallback: first video
   return document.querySelector('video');
@@ -163,13 +170,15 @@ SEEK_FN_TPL = """function() {
     '.artplayer video',
     '#player video',
     '.player video',
-    '[id*=\"player\"] video',
-    '[class*=\"player\"] video',
+    '[id*="player"] video',
+    '[class*="player"] video',
+    'video[id*="player"]',
+    'video[class*="player"]',
   ];
   let v = null;
   for (const sel of selectors) {
     const candidate = document.querySelector(sel);
-    if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) {
+    if (candidate && (candidate.duration > 0 || candidate.readyState >= 2)) {
       v = candidate;
       break;
     }
@@ -182,7 +191,7 @@ SEEK_FN_TPL = """function() {
         const doc = iframe.contentDocument || iframe.contentWindow.document;
         if (doc) {
           const candidate = doc.querySelector('video');
-          if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) {
+          if (candidate && (candidate.duration > 0 || candidate.readyState >= 2)) {
             v = candidate;
             break;
           }
@@ -194,7 +203,7 @@ SEEK_FN_TPL = """function() {
     // Check shadow DOM
     function findInShadow(root) {
       const candidate = root.querySelector('video');
-      if (candidate && candidate.duration && isFinite(candidate.duration) && candidate.duration > 2) return candidate;
+      if (candidate && (candidate.duration > 0 || candidate.readyState >= 2)) return candidate;
       for (const el of root.querySelectorAll('*')) {
         if (el.shadowRoot) {
           const found = findInShadow(el.shadowRoot);
@@ -206,7 +215,7 @@ SEEK_FN_TPL = """function() {
     v = findInShadow(document);
   }
   if (!v) {
-    // Find video with longest duration > 2s
+    // Find video with longest duration > 0
     const videos = document.querySelectorAll('video');
     let best = null;
     let bestDur = 0;
@@ -216,7 +225,17 @@ SEEK_FN_TPL = """function() {
         best = candidate;
       }
     }
-    if (best && bestDur > 2) v = best;
+    if (best && bestDur > 0) v = best;
+  }
+  if (!v) {
+    // Any video with readyState >= 1
+    const videos = document.querySelectorAll('video');
+    for (const candidate of videos) {
+      if (candidate.readyState >= 1) {
+        v = candidate;
+        break;
+      }
+    }
   }
   if (!v) v = document.querySelector('video'); // fallback
   if (!v) return JSON.stringify({err: 'no-video'});

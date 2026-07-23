@@ -44,11 +44,49 @@ firefox-stream-fetch/
 - [x] 写 patch
 - [x] 编译 + 本地 mp4 验证通过（913 帧 36.5s mp4 dump，可 ffplay/转封装）
 - [x] **AAC 音频 dump 验证通过（10s 测试流 → 音视频双轨 mp4）**
+- [x] **哨兵门控 + 哨兵检测（readyState>=3 + currentTime>1）验证通过**（v3.3，v3.4 已删除）
+- [x] **预热丢帧（前 30 sample）验证通过**（v3.3，v3.4 已删除，改由 mux rebase 处理）
+- [x] **PTS dump + PyAV mux 验证通过**
+- [x] **三信号切集检测（BiDi / Firefox URL / PTS跳变）验证通过**
+- [x] **v3.4 简化：删除跨进程门控，单点 mux rebase-at-first-keyframe 处理启动 junk 帧**
 - [ ] Widevine L3 真实内容验证（需手动播放确认 hook 对 EME 路径同样工作）
-- [ ] 编译 + 测试
 
 
 ## 版本记录
+
+### v3.4.0 (2026-07-23) — **当前版本**
+
+**简化：删除 v3.3 门控+预热，dump 单点写 + mux 单点 rebase**
+
+| 维度 | 内容 |
+|---|---|
+| **核心成果** | StreamDumper 不再门控、不再预丢帧。firefox 启动即开始写 dump；启动阶段产生的 junk 帧（about:blank 残留 / decoder warmup）由 mux 阶段的 `--rebase-at-first-keyframe` 按首个 IDR/keyframe 重新对齐 PTS 切除。把"何时开始写"的跨进程协调从 C++ + bash 收到 Python 单点处理 |
+| **删除** | • `sDumpEnabled` / `kDumpSentinelPath` C 端门控静态变量<br>• 每 50 video / 100 audio sample 检查哨兵文件 (`access("/tmp/firefox-stream-dump-enabled")`) <br>• 5 sample 预热丢弃 (`sPreSkipRemaining`) <br>• `extern "C" QueryStreamDumpEnabled / SetStreamDumpEnabled` 外部全局钩子<br>• `bidi-state.py` 的 `streamDumper.enable / disable_streamdump` 命令<br>• `lib-monitor.sh` 的 `_monitor_enable_dump_when_ready` 门控逻辑（保留为 deprecated stub） |
+| **修复** | SDFV 帧格式不一致: 之前 `[data][pts:8]` 与 `sdfv_extract.py` docstring 的 `[size:4][pts:8][data]` 不符。现每帧严格按 `[size_le:4][pts_le:8][data:size]` 写入（docstring 是真相来源, 解析器可靠） |
+| **新加 (Python)** | `sdfv_extract.detect_first_keyframe_index(path)`: 扫描 SDFV, 返回首个 NAL unit_type=5/19/20 (IDR slice) 的 (frame_idx, pts_us) <br>`mux_with_pts.py --rebase-at-first-keyframe`: 找首个 IDR, 把它的 PTS 当 t=0, 跳过帧 + PTS 整体偏移, 写干净 mp4 |
+| **build 验证** | firefox 重新编译成功 (15:26), libxul.so 内 27 处 v3.4 新标记 + 0 处 v3.3 老标记 |
+| **端到端验证** | 5s 测试流 → firefox 启动 → dump.h264 头部正确 (`SDFV` magic + 37 字节 header_len) → 74 帧 PTS 完整 (`0us → 4866666us @ 15fps`) → mux → 320x240 H.264 mp4 4.12s |
+| **新 patch** | `patches/0007-sdfv-frame-format-and-sentinel-removal.patch` |
+
+---
+
+### v3.3.0 (2026-07-22) — 历史版本
+
+**哨兵门控 + PTS dump + 预热丢帧 + 三信号切集检测**
+
+| 维度 | 内容 |
+|---|---|
+| **核心成果** | 彻底解决 Firefox 启动预热阶段 dump 无关帧（about:blank / 占位帧），实现**一次性启动 + 哨兵门控 + PTS 级 mux**，切集检测升级为三信号 OR（BiDi next_episode / Firefox URL 变化 / dump PTS 跳变） |
+| **哨兵门控 (Sentinel Gating)** | StreamDumper C++ 端默认关闭 dump；每 50 视频帧 / 100 音频帧检查 `/tmp/firefox-stream-dump-enabled` 哨兵文件。BiDi 监控检测到 `video.readyState >= 3 && currentTime > 1` 后创建哨兵 → StreamDumper 开始写真帧。移除了旧版“预热 firefox → kill → 重启 Phase 2”的双启动指纹变更。 |
+| **预热丢帧** | C++ 端统一丢弃前 30 个 sample（视频+音频共享计数器），对应约 1s @ 30fps，覆盖 MSE/CDN 路径的 warmup junk frames（前 3-5 帧异常小帧）。 |
+| **dump 格式** | SDFV/SDFA 继续沿用：文件头 magic + 每帧 `[size(4)][pts_us(8)][data]`。新增 `sdfv_extract.py --last-pts-only` 快速读最后一帧 PTS（供切集检测用）。 |
+| **mux 路径** | `mux_with_pts.py` (PyAV) 保留原始 PTS 写入 mp4/m4a → `ffmpeg -c copy` 合并视频+音频，双轨 PTS 时间轴完整保留。Fallback 链：PyAV 失败 → ffmpeg fps 推算；解析失败 → ffprobe 探测。 |
+| **切集检测（三信号 OR）** | 1. **BiDi next_episode_url**（SPA 切 src 仍在同页面，`window.__last_video_info` 有效）<br>2. **Firefox URL 变化**（跨页面导航，持久化在 sidecar.last_ff_url，跨 firefox 重启可靠）<br>3. **dump PTS 跳变**（新帧 PTS < 上一帧 PTS，不依赖 JS/BiDi，纯文件层面）<br>移除旧版 `currentTime > 30s && duration > 60s` 守卫，避免误判。 |
+| **StreamDumper 日志** | 每帧无条件 log（原每 100 帧节流），便于调试 PTS 连续性。 |
+| **预热移除** | Phase 1/Phase 2 合并为单次 Firefox 启动，无需 kill/resume，指纹一致性大幅提升。 |
+| **重新编译 Firefox** | 7/21 完成（含哨兵门控、预热丢帧、PTS dump），7/22 验证通过。 |
+
+---
 
 ### v3.2.0 (2026-07-21)
 
@@ -192,5 +230,21 @@ Patches：
 ## 限制
 
 - 仅对 **L3 软件解密**有效（桌面 Linux 默认）
-- 仅对 **H.264/AVC** 内容有效（最常见）；H.265/AV1 需要适配
+- 仅对 **H.264/HEVC/AV1** 视频内容 + **AAC** 音频有效；其他 codec 不适配
 - 仅供研究/学习，请遵守当地法律
+
+## v3.4 变更摘要
+
+**协议改动**：
+1. `StreamDumper` 行为：firefox 进程启动即开始写 dump（不再等 BiDi 创建哨兵）
+2. 预热 5 帧丢弃删除（由 mux rebase 处理）
+3. SDFV/SDFA 帧格式修正：之前 PTS 在帧尾部 → 现在 PTS 在 `[size][pts]` 头部（mux 端更易解析）
+4. 新增 `mux_with_pts.py --rebase-at-first-keyframe`：自动按首个 IDR 重对齐 PTS
+
+**mux 端使用建议**：
+```bash
+# v3.4 推荐用法 (自动处理 firefox 启动阶段 junk 帧)
+python3 sdfv_extract.py dump.h264
+python3 mux_with_pts.py dump video --rebase-at-first-keyframe
+ffmpeg -i dump.mp4 -i dump.m4a -c copy out.mp4
+```
