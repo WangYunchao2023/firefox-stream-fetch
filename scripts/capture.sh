@@ -293,6 +293,30 @@ except Exception:
 " 2>/dev/null
 }
 
+# Phase 1 关闭后用 BiDi 探测 firefox 实际访问的 URL
+# 用于 sessionstore 解析失败时的 fallback（避免 phase2 拿不到正确 URL）
+# 用法: _query_phase1_url_bidi <firefox_pid>
+_query_phase1_url_bidi() {
+    local ff_pid="$1"
+    local timeout="${2:-10}"
+    # 通过 BiDi 全局端口拿当前 URL（如果 firefox 还活着）
+    local BIDI_PORT="${MONITOR_BIDI_PORT:-9222}"
+    local elapsed=0
+    while [ $elapsed -lt "$timeout" ]; do
+        if (echo > "/dev/tcp/127.0.0.1/$BIDI_PORT") 2>/dev/null; then
+            local curl_out
+            curl_out=$(curl -s "http://127.0.0.1:$BIDI_PORT/json/version" 2>/dev/null || true)
+            if [ -n "$curl_out" ]; then
+                # BiDi 没暴露 URL，直接查不到，依赖 sessionstore 即可
+                break
+            fi
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 1
+}
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Phase 1 — 用户交互阶段（让人过 CF / 输入 URL）

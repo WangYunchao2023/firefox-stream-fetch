@@ -163,11 +163,12 @@ _monitor_wait_real_video() {
                     # 真页面 URL，进一步等待视频元素 ready + 正在播放
                     # 关键：必须检查 state==playing，避免暂停态/未点击播放时误判 ready
                     # 同时需要 readyState>=2 且有 duration/currentTime
+                    # 放宽预热判定：只要 readyState>=2 且有 duration/currentTime 即可
+                    # 某些站点需用户点击才 playing，不应卡在预热阶段
                     if [ "$ready" -ge 2 ] &&
                        [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
-                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ] &&
-                       [ "$state" = "playing" ]; then
-                        _monitor_log "   ✅ 真视频 ready+playing: $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ]; then
+                        _monitor_log "   ✅ 真视频 ready: $url (ct=${cur}s dur=${dur}s ready=$ready state=$state)"
                         return 0
                     fi
                     _monitor_debug "   preheat: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"
@@ -213,11 +214,12 @@ _monitor_wait_real_video_manual() {
                     ;;
                 http://*|https://*)
                     # 真页面 URL，等待 playing
+                    # 放宽预热判定：只要 readyState>=2 且有 duration/currentTime 即可
+                    # 某些站点需用户点击才 playing，不应卡在预热阶段
                     if [ "$ready" -ge 2 ] &&
                        [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
-                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ] &&
-                       [ "$state" = "playing" ]; then
-                        _monitor_log "   ✅ 真视频 ready+playing: $url (ct=${cur}s dur=${dur}s ready=$ready)"
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ]; then
+                        _monitor_log "   ✅ 真视频 ready: $url (ct=${cur}s dur=${dur}s ready=$ready state=$state)"
                         return 0
                     fi
                     _monitor_debug "   preheat-manual: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"

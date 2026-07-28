@@ -138,21 +138,59 @@ def read_last_pts(path):
         return None
 
 
+def detect_first_keyframe_index(sdfv_path: str) -> int:
+    """Scan SDFV file and return index of first IDR frame (NAL type 5/19/20)."""
+    with open(sdfv_path, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'SDFV':
+            raise ValueError(f"Not SDFV file: {magic!r}")
+        version, _reserved = struct.unpack('<BBxxx', f.read(4))
+        (header_len,) = struct.unpack('<I', f.read(4))
+        if header_len > 0:
+            f.seek(header_len, 1)
+
+        frame_idx = 0
+        while True:
+            hdr = f.read(12)
+            if len(hdr) < 12:
+                break
+            frame_size, pts_us = struct.unpack('<IQ', hdr)
+            data = f.read(frame_size)
+            if len(data) < frame_size:
+                break
+            # Check first NAL unit type
+            if data and len(data) >= 5:
+                # NAL header: forbidden_zero_bit(1) + nal_ref_idc(2) + nal_unit_type(5)
+                nal_type = data[0] & 0x1F
+                # IDR types: 5 (H.264), 19 (HEVC IDR_W_RADL), 20 (HEVC IDR_N_LP)
+                if nal_type in (5, 19, 20):
+                    return frame_idx
+            frame_idx += 1
+    return -1
+
+
 def main():
-    if len(sys.argv) not in (2, 3, 4):
-        print(f"Usage: {sys.argv[0]} <input.dump> [pts_offset_us] [--last-pts-only]", file=sys.stderr)
-        sys.exit(1)
-    inp = sys.argv[1]
-    pts_offset = 0
-    last_only = False
-    for arg in sys.argv[2:]:
-        if arg == '--last-pts-only':
-            last_only = True
-        else:
-            pts_offset = int(arg)
+    import argparse
+    parser = argparse.ArgumentParser(description='Parse SDFV/SDFA dump to .raw + .pts')
+    parser.add_argument('input', help='Input dump file')
+    parser.add_argument('pts_offset', nargs='?', type=int, default=0, help='PTS offset in microseconds')
+    parser.add_argument('--last-pts-only', action='store_true', help='Only print last frame PTS')
+    parser.add_argument('--detect-first-keyframe', action='store_true', help='Detect first IDR frame index and print it')
+    args = parser.parse_args()
+
+    inp = args.input
+    pts_offset = args.pts_offset
+    last_only = args.last_pts_only
+    detect_keyframe = args.detect_first_keyframe
+
     base, _ext = os.path.splitext(inp)
     raw_out = base + '.raw'
     pts_out = base + '.pts'
+
+    if detect_keyframe:
+        idx = detect_first_keyframe_index(inp)
+        print(idx)
+        return
 
     n_frames = 0
     first_pts = None
