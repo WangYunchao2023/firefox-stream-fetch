@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v3.5 统一入口
+# firefox-stream-fetch capture.sh — v3.6 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v3.5
+firefox-stream-fetch 统一抓取脚本 v3.6
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -1065,7 +1065,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v3.5                                ║"
+    echo "║  firefox-stream-fetch v3.6                                ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
