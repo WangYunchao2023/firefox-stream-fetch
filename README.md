@@ -50,6 +50,21 @@ firefox-stream-fetch/
 
 ## 版本记录
 
+### v3.5.0 (2026-07-30)
+
+**文档化 + 架构/接口文档**
+
+| 维度 | 内容 |
+|---|---|
+| **文档** | 新增 `ARCHITECTURE.md`（架构图、组件详解、patch 叠加关系）+ `INTERFACES.md`（C++/shell/Python/BiDi 协议） |
+| **用途** | Bug 排查时快速定位组件，无需读全量源码 |
+
+### v3.4.0 (2026-07-22)
+
+**fix(monitor): firefox 启动加 -no-session-restore**
+
+- 防止 session restore 导致页面加载异常
+
 ### v3.2.0 (2026-07-21)
 
 **dump PTS 化 + PyAV mux + 切集检测升级**

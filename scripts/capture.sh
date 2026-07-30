@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v3.2 统一入口
+# firefox-stream-fetch capture.sh — v3.5 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v3.2
+firefox-stream-fetch 统一抓取脚本 v3.5
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -199,8 +199,12 @@ _cleanup_on_start() {
         rm -f "$PROFILE/.parentlock" "$PROFILE/parent.lock" "$PROFILE/lock" 2>/dev/null || true
     fi
 
-    # 5. 上次 phase1 提取的 URL 临时文件（避免本次误用上次的 URL）
-    if [ -n "${PROFILE:-}" ] && [ -f "$PROFILE/.phase1_url" ]; then
+    # 5. 清理上次残留的 .phase1_url（仅清理不同 profile 的，保留当前 profile 的）
+    # Phase 1 → Phase 2 共用同一 PROFILE，.phase1_url 是 URL 交接的关键文件
+    # 不能在这里删除，否则 Phase 2 找不到 URL
+    # 仅在 Phase 1 完成后才清理：phase1() 内部 return 前会删除 lock 文件，.phase1_url 由 Phase 2 消费后自动残留（无影响）
+    # 如需强制清理：显式传 --clear-phase1-url 参数
+    if [ -n "${FORCE_CLEANUP_PHASE1_URL:-}" ] && [ -n "${PROFILE:-}" ] && [ -f "$PROFILE/.phase1_url" ]; then
         rm -f "$PROFILE/.phase1_url"
         echo "🧹 清理上次的 phase1 URL 临时文件"
         cleaned=1
@@ -219,6 +223,33 @@ get_firefox_wid() {
 get_firefox_title() {
     [ -n "$1" ] && XAUTHORITY="$XAUTHORITY" DISPLAY="$DISPLAY" \
         xdotool getwindowname "$1" 2>/dev/null
+}
+
+# 遍历该 PID 下所有窗口，找第一个非 placeholder 的真实标题
+# placeholder 列表：Firefox 未加载页面 / about:home / 等会误判的标题
+get_firefox_real_title() {
+    local pid="$1"
+    local wids
+    wids=$(XAUTHORITY="$XAUTHORITY" DISPLAY="$DISPLAY" \
+        xdotool search --pid "$pid" 2>/dev/null)
+    [ -z "$wids" ] && return 1
+    for wid in $wids; do
+        local title
+        title=$(XAUTHORITY="$XAUTHORITY" DISPLAY="$DISPLAY" \
+            xdotool getwindowname "$wid" 2>/dev/null)
+        if [ -n "$title" ] && \
+           [[ "$title" != "Nightly" && \
+                "$title" != "Firefox" && \
+                "$title" != "Mozilla Firefox" && \
+                "$title" != "firefox-default" && \
+                "$title" != "New Tab" && \
+                "$title" != "about:home" && \
+                "$title" != "about:newtab" ]]; then
+            echo "$title"
+            return 0
+        fi
+    done
+    return 1
 }
 
 pull_window_front() {
@@ -251,70 +282,164 @@ has_valid_cf_cookie() {
     [ "$count" -gt 0 ]
 }
 
-# 从 firefox sessionstore-backups/recovery.jsonlz4 (mozLz40 格式) 解析最近 tab 的 URL
+# 从 firefox sessionstore 文件解析用户实际访问的 URL
 # 用于 phase1 firefox 关闭后,把用户实际访问的 URL 传给 phase2,免去手动重输
 # 用法: _extract_phase1_url <profile_dir>
 _extract_phase1_url() {
     local profile="$1"
+    # 按优先级尝试多个 sessionstore 文件来源
+    local -a candidates=(
+        "$profile/sessionstore-backups/recovery.jsonlz4"
+        "$profile/sessionstore-backups/recovery.baklz4"
+        "$profile/sessionstore.js"
+    )
     local session_file=""
-    # 优先 recovery.jsonlz4 (最新),否则 fallback 到 sessionstore.js (老格式)
-    if [ -f "$profile/sessionstore-backups/recovery.jsonlz4" ]; then
-        session_file="$profile/sessionstore-backups/recovery.jsonlz4"
-    elif [ -f "$profile/sessionstore.js" ]; then
-        session_file="$profile/sessionstore.js"
-    else
-        return 1
-    fi
-    python3 -c "
-import sys, json
-try:
-    try:
-        import lz4.block
-        with open('$session_file', 'rb') as f:
-            raw = f.read()
-        if raw.startswith(b'mozLz40\x00'):
-            data = lz4.block.decompress(raw[8:])
-        else:
-            data = raw
-    except ImportError:
-        with open('$session_file', 'rb') as f:
-            raw = f.read()
-        data = raw[8:] if raw.startswith(b'mozLz40\x00') else raw
-    d = json.loads(data)
-    for w in d.get('windows', []):
-        for t in w.get('tabs', []):
-            for e in t.get('entries', []):
-                url = e.get('url', '')
-                if url.startswith('http://') or url.startswith('https://'):
-                    print(url)
-                    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null
+    for candidate in "${candidates[@]}"; do
+        if [ -f "$candidate" ]; then
+            session_file="$candidate"
+            break
+        fi
+    done
+    [ -z "$session_file" ] && return 1
+
+    local result=""
+    # 对 LZ4 文件，添加重试逻辑（Firefox 退出后 sessionstore 可能需要时间落盘）
+    local retries=0
+    local max_retries=8
+    while [ $retries -lt $max_retries ]; do
+        result=$(python3 - "$session_file" 2>/dev/null << 'PYEOF'
+import sys, json, lz4.block
+session_file = sys.argv[1]
+with open(session_file, 'rb') as f:
+    raw = f.read()
+if raw.startswith(b'mozLz40\x00'):
+    data = lz4.block.decompress(raw[8:])
+else:
+    data = raw
+d = json.loads(data)
+# 按时间顺序收集所有 URL（可能有多个 tab/redirect）
+urls = []
+for w in d.get('windows', []):
+    for t in w.get('tabs', []):
+        for e in t.get('entries', []):
+            u = e.get('url', '')
+            if u.startswith('http://') or u.startswith('https://'):
+                urls.append(u)
+# 返回最后一个（最新的）URL
+if urls:
+    print(urls[-1])
+PYEOF
+)
+        if [ -n "$result" ]; then
+            echo "$result"
+            return 0
+        fi
+        # LZ4 文件可能还在被 Firefox 写入,等待后重试
+        if [[ "$session_file" == *.lz4* ]]; then
+            sleep 1
+            retries=$((retries + 1))
+            continue
+        fi
+        break
+    done
+
+    # 所有候选文件都尝试完毕,返回空
+    return 1
 }
 
-# Phase 1 关闭后用 BiDi 探测 firefox 实际访问的 URL
-# 用于 sessionstore 解析失败时的 fallback（避免 phase2 拿不到正确 URL）
-# 用法: _query_phase1_url_bidi <firefox_pid>
-_query_phase1_url_bidi() {
-    local ff_pid="$1"
-    local timeout="${2:-10}"
-    # 通过 BiDi 全局端口拿当前 URL（如果 firefox 还活着）
-    local BIDI_PORT="${MONITOR_BIDI_PORT:-9222}"
-    local elapsed=0
-    while [ $elapsed -lt "$timeout" ]; do
-        if (echo > "/dev/tcp/127.0.0.1/$BIDI_PORT") 2>/dev/null; then
-            local curl_out
-            curl_out=$(curl -s "http://127.0.0.1:$BIDI_PORT/json/version" 2>/dev/null || true)
-            if [ -n "$curl_out" ]; then
-                # BiDi 没暴露 URL，直接查不到，依赖 sessionstore 即可
-                break
-            fi
-        fi
-        sleep 1
-        elapsed=$((elapsed + 1))
-    done
+# 从 places.sqlite 拿用户访问过的 http(s) URL（最可靠）
+# Firefox 每次访问 URL 都会同步写入 places.sqlite 的 moz_places 表
+# 相比 sessionstore-backups/recovery.jsonlz4（异步写入，50% 只含 about:newtab）可靠得多
+# 注意：sqlite3 需在 Firefox 完全退出后调用（避开文件锁）
+# 用法: _extract_phase1_url_places <profile_dir>
+#   退出码 0: 拿到 URL（输出 URL）
+#   退出码 1: 未拿到（profile 不存在 / 无 places.sqlite / 无 http URL）
+_extract_phase1_url_places() {
+    local profile="$1"
+    local places="$profile/places.sqlite"
+    [ -f "$places" ] || return 1
+
+    # 取最近访问的 http(s) URL（排除 about:/chrome:/file:// 等内部页）
+    # last_visit_date 是微秒时间戳，ORDER BY DESC LIMIT 1 取最新
+    # 过滤掉 CF challenge URL（含 __cf_chl），避免 phase2 重进 CF 挑战页
+    local url
+    url=$(sqlite3 "$places" \
+        "SELECT url FROM moz_places
+         WHERE last_visit_date IS NOT NULL
+           AND (url LIKE 'http://%' OR url LIKE 'https://%')
+           AND url NOT LIKE '%__cf_chl%'
+         ORDER BY last_visit_date DESC LIMIT 1" 2>/dev/null)
+    if [ -n "$url" ]; then
+        echo "$url"
+        return 0
+    fi
     return 1
+}
+
+# 通过 BiDi 拿到 firefox 当前所有 tab 的 URL，找第一个 http(s) URL
+# 【Phase 1 不再使用——开 BiDi 会让地址栏变红触发 CF 反复验证】
+# 仅保留供未来参考（如 Phase 2 等场景）
+# 用法: _query_phase1_url_bidi [firefox_pid]
+#   退出码 0: 拿到 URL（输出 URL）
+#   退出码 1: 未拿到
+#   退出码 2: BiDi 不可达
+_query_phase1_url_bidi() {
+    local BIDI_PORT="${MONITOR_BIDI_PORT:-9222}"
+    # 先探测端口是否可达
+    (echo > "/dev/tcp/127.0.0.1/$BIDI_PORT") 2>/dev/null || return 2
+
+    # 用 websocket-client 连 BiDi，调 browsingContext.getTree 拿所有 tab URL
+    python3 - "$BIDI_PORT" << 'PYEOF' 2>/dev/null
+import json, sys
+try:
+    import websocket
+except ImportError:
+    sys.exit(3)
+port = sys.argv[1]
+try:
+    ws = websocket.create_connection(f"ws://127.0.0.1:{port}/session", timeout=3, suppress_origin=True)
+except Exception:
+    sys.exit(2)
+try:
+    msg_id = 1
+    ws.send(json.dumps({
+        "id": msg_id,
+        "method": "browsingContext.getTree",
+        "params": {"maxDepth": 3},
+    }))
+    while True:
+        resp = ws.recv()
+        try:
+            r = json.loads(resp)
+        except Exception:
+            continue
+        if r.get("id") != msg_id:
+            continue
+        if r.get("type") != "success":
+            sys.exit(1)
+        # 递归遍历 contexts 找第一个 http(s) URL
+        contexts = r.get("result", {}).get("contexts", []) or []
+        def walk(ctx):
+            url = ctx.get("url", "") or ""
+            if url.startswith(("http://", "https://")):
+                return url
+            for ch in ctx.get("children", []) or []:
+                u = walk(ch)
+                if u:
+                    return u
+            return None
+        for ctx in contexts:
+            u = walk(ctx)
+            if u:
+                print(u)
+                sys.exit(0)
+        sys.exit(1)
+finally:
+    try:
+        ws.close()
+    except Exception:
+        pass
+PYEOF
 }
 
 
@@ -357,9 +482,11 @@ PJEOF
     _clear_proxy_env
 
     local start_url="${URL:-about:newtab}"
-    echo "🚀 启动 Firefox（Phase 1: sandbox 默认 + 不开 BiDi）..."
+    echo "🚀 启动 Firefox（Phase 1: sandbox 默认 + 不开 BiDi 避免 CF 指纹）..."
     echo "   起始 URL: $start_url"
 
+    # 【关键】Phase 1 不开 BiDi！开 BiDi 会让地址栏变红 → CF 检测到调试端口 → 反复弹验证
+    # URL 获取走 places.sqlite（Firefox 同步写入历史数据库，最可靠）
     setsid nohup "$FF" \
         -profile "$PROFILE" \
         -no-remote --new-instance \
@@ -393,96 +520,106 @@ PJEOF
         elapsed=$((elapsed + 3))
 
         local title
-        title=$(get_firefox_title "$WID")
+        # 遍历该 PID 下所有窗口，找第一个非 placeholder 的真实标题
+        title=$(get_firefox_real_title "$PID")
         if [ -n "$title" ]; then
             if echo "$title" | grep -qi "Just a moment"; then
                 [ $saw_cf -eq 0 ] && echo "  [$elapsed s] ⏳ CF 挑战中..." && saw_cf=1
-            elif [[ "$title" != "Nightly" &&
-                    "$title" != "Firefox" &&
-                    "$title" != "New Tab" &&
-                    "$title" != "about:home" &&
-                    "$title" != "about:newtab" ]]; then
+            else
                 echo "  ✅ [$elapsed s] 检测到页面加载完成（标题: '$title'）"
-                # 给页面再 5s 让 MediaSource 进入 first segment，sessionstore 同步记录最后访问的 URL
-                # 之前 sleeps 2s + 5s = 7s, 但 SIGTERM 后 xpcshell shutdown 异步同步 sessionstore.jsonlz4
-                # 偶尔 5s 不够，导致 _extract_phase1_url 拿不到 URL。
-                # 这里在 SIGTERM 之后再多等等到 sessionstore 出现 yfsp 类 URL 再继续。
+                # 给页面再 5s 让 MediaSource 进入 first segment，places.sqlite 同步记录访问
+                # 注意：不开 BiDi（地址栏变红触发 CF 反复挑战），URL 走 places.sqlite 获取
                 sleep 5
+
                 echo "  🔪 关闭 Phase 1 Firefox（SIGTERM 保存 session/cookie）..."
                 kill -15 "$PID" 2>/dev/null || true
-                # 等待 sessionstore.jsonlz4 / .baklz4 出现最后的真 URL（包含 http(s)://）
-                # 最准同时机：firefox 退出会依次写 recovery.jsonlz4 包含未来恢复需要的最近访问的 URL
-                local session_wait=0
-                while [ "$session_wait" -lt 15 ]; do
-                    if [ -f "$PROFILE/sessionstore-backups/recovery.jsonlz4" ]; then
-                        local probe
-                        probe=$(python3 -c "
-import sys, json
-try:
-    import lz4.block
-    with open('$PROFILE/sessionstore-backups/recovery.jsonlz4', 'rb') as f:
-        raw = f.read()
-    data = lz4.block.decompress(raw[8:]) if raw.startswith(b'mozLz40\x00') else raw
-    d = json.loads(data)
-    for w in d.get('windows', []):
-        for t in w.get('tabs', []):
-            for e in t.get('entries', []):
-                u = e.get('url', '')
-                if u.startswith('http'):
-                    print(u); sys.exit(0)
-    sys.exit(1)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null)
-                        if [ -n "$probe" ]; then
-                            echo "  📎 phase1 退出前 会话检测到 http URL=$probe"
-                            break
-                        fi
-                    fi
+                # 等待 firefox 进程自然退出（sessionstore/cookies 同步需要时间）
+                local ff_exit_wait=0
+                while kill -0 "$PID" 2>/dev/null && [ $ff_exit_wait -lt 10 ]; do
                     sleep 1
-                    session_wait=$((session_wait + 1))
+                    ff_exit_wait=$((ff_exit_wait + 1))
                 done
+                if kill -0 "$PID" 2>/dev/null; then
+                    echo "  ⚠️  Firefox 未响应 SIGTERM，强制退出"
+                    kill -9 "$PID" 2>/dev/null || true
+                    sleep 1
+                fi
+                echo "  ✅ Firefox 已退出 (${ff_exit_wait}s)"
                 kill -9 "$PID" 2>/dev/null || true
 
-                # 等 cookies.sqlite 落盘
-                local wait_cookie=0
-                while [ $wait_cookie -lt 10 ]; do
-                    if [ -f "$PROFILE/cookies.sqlite" ]; then
-                        local cf_count
-                        cf_count=$(sqlite3 "$PROFILE/cookies.sqlite" \
-                            "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance' AND expiry > strftime('%s','now')" \
-                            2>/dev/null || echo 0)
-                        if [ "$cf_count" -gt 0 ]; then
-                            echo "  ✅ Cookie 已落盘 ($cf_count 条 cf_clearance)"
-                            clear_locks
-                            # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
-                            local phase1_url=""
-                            phase1_url=$(_extract_phase1_url "$PROFILE")
-                            if [ -n "$phase1_url" ]; then
-                                echo "$phase1_url" > "$PROFILE/.phase1_url"
-                                echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
-                            fi
-                            return 0
-                        fi
+                # 等待 sessionstore 写完整（Firefox 退出后 sessionstore 是异步写入的）
+                # 先等文件出现 + 稳定，再读取
+                local session_sync=0
+                local max_session_sync=20
+                while [ "$session_sync" -lt "$max_session_sync" ]; do
+                    if [ -f "$PROFILE/sessionstore-backups/recovery.jsonlz4" ] && \
+                       [ -f "$PROFILE/cookies.sqlite" ]; then
+                        # 文件存在，再等 2s 确保写入完成
+                        sleep 2
+                        echo "  ✅ sessionstore + cookies 文件已就绪 (${session_sync}s)"
+                        break
                     fi
                     sleep 1
-                    wait_cookie=$((wait_cookie + 1))
+                    session_sync=$((session_sync + 1))
                 done
+                [ "$session_sync" -ge "$max_session_sync" ] && \
+                    echo "  ⚠️  sessionstore 文件等待超时 (${max_session_sync}s)"
 
-                # 没 cf_clearance 也继续（可能不需要 CF）
-                clear_locks
-
-                # 提取 phase1 firefox 实际 URL（从 sessionstore 解析），让 phase2 自动用这个 URL
+                # 优先从 places.sqlite 拿 URL（Firefox 同步写入历史数据库，最可靠）
+                # sessionstore 异步写入 50% 只含 about:newtab，places.sqlite 每次访问必写
+                # sqlite3 需在 Firefox 完全退出后调用（避开文件锁）
                 local phase1_url=""
-                phase1_url=$(_extract_phase1_url "$PROFILE")
+                phase1_url=$(_extract_phase1_url_places "$PROFILE")
                 if [ -n "$phase1_url" ]; then
                     echo "$phase1_url" > "$PROFILE/.phase1_url"
-                    echo "  📎 Phase 1 实际 URL: $phase1_url（phase2 自动续接）"
+                    echo "  📎 Phase 1 实际 URL（places.sqlite）: $phase1_url（phase2 自动续接）"
                 else
-                    echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home"
+                    echo "  🔄 places.sqlite 未拿到 URL，尝试 sessionstore 兜底..."
+                    # sessionstore 兜底：recovery.jsonlz4 → recovery.baklz4 → sessionstore.js
+                    phase1_url=$(_extract_phase1_url "$PROFILE")
+                    if [ -n "$phase1_url" ]; then
+                        echo "$phase1_url" > "$PROFILE/.phase1_url"
+                        echo "  📎 Phase 1 实际 URL（sessionstore）: $phase1_url（phase2 自动续接）"
+                    else
+                        # 兜底：检查 sessionstore.js（非 LZ4 格式，可能已写入）
+                        if [ -f "$PROFILE/sessionstore.js" ]; then
+                            phase1_url=$(python3 -c "
+import sys, json
+with open('$PROFILE/sessionstore.js', 'rb') as f:
+    raw = f.read()
+try:
+    d = json.loads(raw) if not raw.startswith(b'mozLz40') else json.loads(lz4.block.decompress(raw[8:]))
+except:
+    d = {}
+urls = [e.get('url','') for w in d.get('windows',[]) for t in w.get('tabs',[]) for e in t.get('entries',[])]
+urls = [u for u in urls if u.startswith('http')]
+if urls: print(urls[-1])
+" 2>/dev/null)
+                            if [ -n "$phase1_url" ]; then
+                                echo "$phase1_url" > "$PROFILE/.phase1_url"
+                                echo "  📎 Phase 1 实际 URL（sessionstore.js）: $phase1_url（phase2 自动续接）"
+                            fi
+                        fi
+                        if [ -z "$phase1_url" ]; then
+                            echo "  ⚠️  无法从 sessionstore 提取 URL，phase2 将用 about:home"
+                        fi
+                    fi
                 fi
 
-                echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
+                # 检查 cookies 状态
+                if [ -f "$PROFILE/cookies.sqlite" ] && [ -s "$PROFILE/cookies.sqlite" ]; then
+                    local cf_count
+                    cf_count=$(sqlite3 "$PROFILE/cookies.sqlite" \
+                        "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance' AND expiry > strftime('%s','now')" \
+                        2>/dev/null || echo 0)
+                    if [ "$cf_count" -gt 0 ]; then
+                        echo "  ✅ Cookie 已落盘 ($cf_count 条 cf_clearance)"
+                    else
+                        echo "  ⚠️  无 cf_clearance cookie（可能不需要 CF / 验证未完成）"
+                    fi
+                fi
+
+                clear_locks
                 return 0
             fi
         fi
@@ -511,6 +648,26 @@ phase2() {
     # --skip-phase1 时 profile 目录可能不存在,确保存在
     [ -d "$PROFILE" ] || mkdir -p "$PROFILE"
 
+    # 【关键修复】Phase 1 写的 user.js 有 browser.startup.page=3 (恢复上次会话)，
+    # 与 -no-session-restore 冲突，导致 Firefox 偶尔不加载命令行传入的 URL。
+    # user.js 优先级 > prefs.js，所以只改 prefs.js 不够。
+    # 这里直接 sed 删除 user.js 里冲突的 prefs，并写 Phase 2 用的覆盖值。
+    local UJS="$PROFILE/user.js"
+    if [ -f "$UJS" ]; then
+        # 删除 Phase 1 的冲突 prefs
+        sed -i '/user_pref("browser\.startup\.page"/d' "$UJS" 2>/dev/null || true
+        sed -i '/user_pref("browser\.sessionstore\.resume_from_crash"/d' "$UJS" 2>/dev/null || true
+        sed -i '/user_pref("browser\.sessionstore\.max_resumed_crashes"/d' "$UJS" 2>/dev/null || true
+        # Phase 2 覆盖：startup.page=1 (home page) + resume_from_crash=false，这样 Firefox 会加载命令行传入的 URL
+        cat >> "$UJS" << 'UJPJEOF'
+// === Phase 2 覆盖：让 Firefox 加载命令行传入的 URL，不要恢复上次会话 ===
+user_pref("browser.startup.page", 1);
+user_pref("browser.sessionstore.resume_from_crash", false);
+user_pref("browser.sessionstore.max_resumed_crashes", 0);
+UJPJEOF
+        echo "  🔧 Phase 2 重写 user.js 冲突 prefs (startup.page=1 + resume_from_crash=false)"
+    fi
+
     # 关 sandbox（StreamDumper 写 /tmp 需要）
     # prefs.js 可能不存在（全新 profile）, touch 一下
     local PJS="$PROFILE/prefs.js"
@@ -530,6 +687,41 @@ EP
 
     clear_locks
     _apply_proxy_env
+
+    # 确保 Phase 1 Firefox 完全退出 + cookies.sqlite 锁释放
+    echo "   ⏳ 等待 Phase 1 Firefox 完全退出..."
+    local wait_exit=0
+    while [ $wait_exit -lt 10 ]; do
+        # 检查 profile 中是否还有 firefox 进程
+        local ff_running
+        ff_running=$(ps -ef | grep -v grep | grep -F "firefox" | grep -F -- "-profile $PROFILE" | wc -l)
+        if [ "$ff_running" -eq 0 ]; then
+            # 等文件锁释放
+            sleep 1
+            echo "  ✅ Phase 1 Firefox 已完全退出"
+            break
+        fi
+        sleep 1
+        wait_exit=$((wait_exit + 1))
+    done
+    if [ $wait_exit -ge 10 ]; then
+        echo "  ⚠️  Phase 1 Firefox 退出超时，强制清理"
+        ps -ef | grep -v grep | grep -F "firefox" | grep -F -- "-profile $PROFILE" | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+    fi
+
+    # 验证 cookies.sqlite 是否存在且可读取
+    if [ -f "$PROFILE/cookies.sqlite" ]; then
+        local cookie_size
+        cookie_size=$(stat -c%s "$PROFILE/cookies.sqlite" 2>/dev/null || echo 0)
+        echo "  📎 cookies.sqlite 大小: $cookie_size bytes"
+        if [ "$cookie_size" -gt 0 ]; then
+            local cf_check
+            cf_check=$(sqlite3 "$PROFILE/cookies.sqlite" "SELECT COUNT(*) FROM moz_cookies WHERE name='cf_clearance'" 2>/dev/null || echo 0)
+            echo "  📎 cf_clearance cookies: $cf_check"
+        fi
+    else
+        echo "  ⚠️  警告：cookies.sqlite 不存在，Phase 2 可能无法复用 CF 验证"
+    fi
 
     local out_base=$(OUT_BASE)
     local DUMP_FILE="${out_base}.h264"
@@ -556,14 +748,26 @@ EP
     export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
     # 预热 firefox stdout/stderr 写到 $LOG（让 firefox 自己的错误信息能保留）
     export MOZ_LOG_FILE="$LOG"
+    # 清理 Firefox 内部日志文件（.moz_log 由子进程生成，无害但会堆积磁盘）
+    find "$OUTPUT_DIR" -maxdepth 1 -name '*.moz_log' -delete 2>/dev/null || true
 
-    # Phase 2 URL 优先级：命令行 URL > phase1 URL（从 sessionstore 提取）> about:home
-    # phase1 firefox 关闭后,我们解析 sessionstore 拿到用户实际访问的 URL,写到 $PROFILE/.phase1_url
+    # Phase 2 URL 优先级：命令行 URL > phase1 URL（places.sqlite → sessionstore 兜底）> about:home
+    # phase1 firefox 关闭后,查 places.sqlite 拿真实访问 URL（同步写入,最可靠）写到 $PROFILE/.phase1_url
+    # places.sqlite 拿不到才 fallback 到 sessionstore（异步写入不可靠）
     # phase2 自动续接,免去用户手动重输
     local PHASE2_URL=""
     local MANUAL_URL_MODE=0
+    
+    # 调试：检查 .phase1_url 文件
+    if [ -f "$PROFILE/.phase1_url" ]; then
+        echo "  📎 调试：.phase1_url 文件存在，内容=$(cat "$PROFILE/.phase1_url" 2>/dev/null | head -1)"
+    else
+        echo "  ⚠️  调试：.phase1_url 文件不存在"
+    fi
+    
     if [ -n "${URL:-}" ]; then
         PHASE2_URL="$URL"
+        echo "  📎 Phase2 URL 来自命令行: $PHASE2_URL"
     elif [ -s "$PROFILE/.phase1_url" ]; then
         PHASE2_URL=$(cat "$PROFILE/.phase1_url" 2>/dev/null || true)
         if [ -n "$PHASE2_URL" ]; then
@@ -579,7 +783,7 @@ EP
     echo "   Profile: $PROFILE"
     echo "   详细日志: $LOG"
     if [ $MANUAL_URL_MODE -eq 1 ]; then
-        echo "   🔧 手工 URL 模式：等待用户点击播放后再开始抓取"
+        echo "   🔧 手工 URL 模式：URL 自动传入，等网站自动播放即可"
     fi
     echo ""
 
@@ -590,9 +794,21 @@ EP
     monitor_result=$(monitor_run "$FF" "$PROFILE" "$PHASE2_URL" \
         "$DUMP_FILE" "$AUDIO_DUMP" "$SIDECAR" "$MANUAL_URL_MODE" 2> >(tee -a "$LOG" >&2))
 
+    # 过滤监控输出中的 BiDi JSON 泄漏（daemon 启动/停止时可能输出 {"ok": true, ...} 污染 reason）
+    # 保留最后一行（格式为 reason|interrupt|video|audio）作为有效输出
+    local clean_output
+    clean_output=$(echo "$monitor_result" | grep -v '^{' | grep -v '^$' | tail -1)
+    if [ -z "$clean_output" ]; then
+        clean_output=$(echo "$monitor_result" | grep -E '^(ended|stall_limit|paused_too_long|max_interrupts|next_episode)' | tail -1)
+    fi
+    monitor_result="${clean_output:-$monitor_result}"
     echo "$monitor_result"
     local reason interrupt final_video final_audio
     IFS='|' read -r reason interrupt final_video final_audio <<< "$monitor_result"
+    # 安全处理：确保 interrupt 为整数，空值默认为 0
+    if ! [[ "$interrupt" =~ ^[0-9]+$ ]]; then
+        interrupt=0
+    fi
 
     DUMP_FILE="$final_video"
     AUDIO_DUMP="$final_audio"
@@ -683,6 +899,24 @@ mux_to_mp4() {
         fi
     fi
 
+    # 预先计算音频时长（audio as clock）：用 AAC 帧数 × 1024 / sample_rate
+    # 视频 PTS 不可信时（firefox mTime chunk 边界跳变），用音频时长作为视频时间轴基准
+    local audio_duration_us=0
+    local extracted_a_raw="${audio%.aac}.raw"
+    local extracted_a_pts="${audio%.aac}.pts"
+    if [ -s "$audio" ] && [ ! -s "$extracted_a_pts" ]; then
+        # 还没解析过音频，先解析一次（仅为了帧数，不立即 mux）
+        python3 "$extractor" "$audio" >/dev/null 2>&1 || true
+    fi
+    if [ -s "$extracted_a_pts" ]; then
+        local a_n_frames a_sample_rate
+        a_n_frames=$(wc -l < "$extracted_a_pts")
+        a_sample_rate=$(ffprobe -v error -select_streams a:0 -show_entries stream=sample_rate -of csv=p=0 "$audio" 2>/dev/null | head -1)
+        [ -z "$a_sample_rate" ] && a_sample_rate="44100"
+        audio_duration_us=$((a_n_frames * 1024 * 1000000 / a_sample_rate))
+        echo "  🎵 audio as clock: ${a_n_frames} 帧 × 1024 / ${a_sample_rate}Hz = ${audio_duration_us}us ($((audio_duration_us/1000000)).$(( (audio_duration_us/100000) % 10 ))s)"
+    fi
+
     # 用 PyAV 封装（保留原始 PTS）
     if [ -s "$extracted_pts" ] && [ -s "$extracted_raw" ]; then
         local first_pts last_pts n_frames dur_s
@@ -692,8 +926,34 @@ mux_to_mp4() {
         dur_s=$(awk -v a="$first_pts" -v b="$last_pts" 'BEGIN{printf "%.3f", (b-a)/1000000}')
         echo "  ✅ PTS: $n_frames 帧，时长 ${dur_s}s, 首帧 PTS=${first_pts}us"
 
+        # 检查 PTS 是否可信：span 过短（firefox MSE mTime 在 chunk 边界会乱）
+        # 判定: span < n_frames / 30 秒 -> PTS 不可信，优先用音频时长作时钟源
+        local pts_reliable=1
+        local fps_detected=""
+        if [ "$n_frames" -gt 100 ]; then
+            local min_dur
+            min_dur=$(awk -v n="$n_frames" 'BEGIN{printf "%.3f", n/30}')
+            local dur_check
+            dur_check=$(awk -v d="$dur_s" 'BEGIN{print (d < '"$min_dur"') ? "1" : "0"}')
+            if [ "$dur_check" = "1" ]; then
+                pts_reliable=0
+                if [ "$audio_duration_us" -gt 0 ]; then
+                    fps_detected=$(awk -v n="$n_frames" -v d="$audio_duration_us" 'BEGIN{printf "%.4f", n*1000000/d}')
+                    echo "  ⚠️  PTS span 过短（${dur_s}s < ${min_dur}s），从音频时长推算视频帧率 ${fps_detected}fps（audio as clock）"
+                else
+                    # 无音频参考时，fallback 到 SPS 读帧率
+                    fps_detected=$(ffprobe -v error -select_streams v:0 \
+                        -of default=noprint_wrappers=1:nokey=1 \
+                        -show_entries stream=r_frame_rate "$extracted_raw" 2>/dev/null \
+                        | awk -F'/' 'NF==2 && $2>0 {printf "%.4f", $1/$2; exit} NF==1 {printf "%.4f", $1; exit}')
+                    [ -z "$fps_detected" ] || [ "$fps_detected" = "0.0000" ] && fps_detected="25"
+                    echo "  ⚠️  PTS span 过短（${dur_s}s < ${min_dur}s），从 SPS 读帧率 ${fps_detected}fps"
+                fi
+            fi
+        fi
+
         # PyAV 封装：每帧写入实际 PTS，保留与 dump 一致的时间轴
-        if python3 "$muxer_py" "$base" video 2>&1 | tee /tmp/mux_py.log; then
+        if python3 "$muxer_py" "$base" video --audio-duration-us "$audio_duration_us" 2>&1 | tee /tmp/mux_py.log; then
             local py_v="${base}.mp4"
             if [ -s "$py_v" ]; then
                 tmp_v_py="$py_v"
@@ -701,7 +961,11 @@ mux_to_mp4() {
             else
                 echo "  ⚠️  PyAV 输出为空，回退到 ffmpeg fps"
                 local fps
-                fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+                if [ "$pts_reliable" = "0" ]; then
+                    fps="$fps_detected"
+                else
+                    fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+                fi
                 ffmpeg -y -fflags +genpts -r "$fps" -i "$extracted_raw" \
                     -c:v copy -movflags +faststart "$tmp_v" -loglevel error
                 tmp_v_py="$tmp_v"
@@ -709,7 +973,11 @@ mux_to_mp4() {
         else
             echo "  ⚠️  PyAV mux 失败，回退到 ffmpeg fps"
             local fps
-            fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+            if [ "$pts_reliable" = "0" ]; then
+                fps="$fps_detected"
+            else
+                fps=$(awk -v n="$n_frames" -v d="$dur_s" 'BEGIN{printf "%.4f", n/d}')
+            fi
             ffmpeg -y -fflags +genpts -r "$fps" -i "$extracted_raw" \
                 -c:v copy -movflags +faststart "$tmp_v" -loglevel error
             tmp_v_py="$tmp_v"
@@ -779,6 +1047,9 @@ mux_to_mp4() {
         mv "$tmp_v_py" "$out"
     fi
 
+    # 统一清理临时 mp4/m4a（多分支中部分路径漏了 rm .tmpv.mp4/.tmp_a_py，留在 OUTPUT_DIR 变垃圾）
+    rm -f "$tmp_v_py" "$tmp_a_py"
+
     echo "  ✅ mp4: $out"
     ls -lh "$out"
     ffprobe -v error -show_entries format=duration:stream=codec_name,width,height \
@@ -794,7 +1065,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v3.2                                ║"
+    echo "║  firefox-stream-fetch v3.5                                ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
@@ -850,6 +1121,13 @@ main() {
         find "$OUTPUT_DIR" -name "${BASE_NAME}-*" ! -name "*.mp4" ! -name "*.log" ! -name "*.sidecar.json" -delete 2>/dev/null || true
         echo "  ✅ (保留 mp4 + log + sidecar)"
     fi
+
+    # 清理 Firefox 内部调试日志（.moz_log 由子进程生成）
+    find "$OUTPUT_DIR" -maxdepth 1 -name '*.moz_log' -delete 2>/dev/null || true
+    # 清理 bidi daemon 日志
+    rm -f /tmp/bidi-daemon.log 2>/dev/null || true
+    # 解除环境残留，避免影响后续进程
+    unset MOZ_LOG_FILE 2>/dev/null || true
 
     echo ""
     echo "🏁 任务结束。"
