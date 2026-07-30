@@ -233,6 +233,46 @@ def check_port(host, port, timeout=2):
         return False
 
 
+def bidi_navigate_url(port, target_url, timeout=10):
+    """连 BiDi、创 session、强制导航 Firefox 到 target_url。
+    用于 Phase 2：user.js 里 startup.page=3 与 -no-session-restore 冲突，
+    Firefox 偶尔不会加载命令行传入的 URL，此时用 BiDi 强制 navigate 一次。
+    返回 True 成功，False 失败。
+    """
+    if not check_port("127.0.0.1", port):
+        return False
+    sess = BidiSession(port)
+    ok, err = sess.connect(timeout=timeout)
+    if not ok:
+        return False
+    try:
+        # 拿 root context
+        r = sess._call("browsingContext.getTree", {"maxDepth": 3}, timeout=5)
+        if not r or r.get("type") != "success":
+            return False
+        contexts = r.get("result", {}).get("contexts", []) or []
+        if not contexts:
+            # 没 context, 创一个
+            r = sess._call("browsingContext.create", {"type": "tab"}, timeout=5)
+            if not r or r.get("type") != "success":
+                return False
+            ctx_id = r.get("result", {}).get("context")
+        else:
+            ctx_id = contexts[0].get("context")
+        if not ctx_id:
+            return False
+        # 导航到目标 URL
+        r = sess._call("browsingContext.navigate", {"context": ctx_id, "url": target_url}, timeout=10)
+        if not r or r.get("type") != "success":
+            return False
+        return True
+    finally:
+        try:
+            sess.close()
+        except Exception:
+            pass
+
+
 class BidiSession:
     """长驻 firefox BiDi session，单 ws + 单 session"""
     def __init__(self, port):
@@ -353,6 +393,12 @@ class BidiSession:
         return {"ok": True}
 
     def close(self):
+        if self.ws and self.session_id:
+            try:
+                # Explicitly end the BiDi session to free up Firefox's session slot
+                self._call("session.end", {}, timeout=3)
+            except Exception:
+                pass
         if self.ws:
             try:
                 self.ws.close()
@@ -528,6 +574,16 @@ def cmd_seek(args):
         sess.close()
 
 
+def cmd_navigate(args):
+    """强制 firefox navigate 到指定 URL，绕开 user.js startup.page=3 与 -no-session-restore 冲突。"""
+    if bidi_navigate_url(args.port, args.url):
+        print(json.dumps({"ok": True, "url": args.url}))
+        sys.exit(0)
+    else:
+        print(json.dumps({"err": "navigate failed", "url": args.url}), file=sys.stderr)
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -554,6 +610,11 @@ def main():
     p_seek.add_argument("--port", type=int, default=9222)
     p_seek.add_argument("--url-pattern", default=None)
     p_seek.set_defaults(func=cmd_seek)
+
+    p_nav = sub.add_parser("navigate", help="强制导航 firefox 到指定 URL（绕开 user.js startup.page 冲突）")
+    p_nav.add_argument("url", help="目标 URL")
+    p_nav.add_argument("--port", type=int, default=9222)
+    p_nav.set_defaults(func=cmd_navigate)
 
     args = parser.parse_args()
     args.func(args)

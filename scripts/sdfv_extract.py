@@ -29,14 +29,16 @@ def parse_dump(path):
     with open(path, 'rb') as f:
         magic = f.read(4)
         if magic == b'SDFV':
-            version, _reserved = struct.unpack('<BBxxx', f.read(4))
+            # 文件格式: magic(4) + version(1) + reserved(3) + header_len_le(4) = 12 bytes
+            version, _reserved = struct.unpack('<B3s', f.read(4))
             (header_len,) = struct.unpack('<I', f.read(4))
             # 跳过 SPS/PPS header（已写入文件但 mux 时 ffmpeg 需要从 extra_data 读）
             if header_len > 0:
                 f.seek(header_len, 1)  # skip header
             fmt = 'video'
         elif magic == b'SDFA':
-            version, _reserved = struct.unpack('<BBxxx', f.read(4))
+            # 文件格式: magic(4) + version(1) + reserved(3) = 8 bytes (无 header_len)
+            version, _reserved = struct.unpack('<B3s', f.read(4))
             fmt = 'audio'
         else:
             print(f"ERROR: not a SDF dump (magic={magic!r})", file=sys.stderr)
@@ -63,77 +65,40 @@ def parse_dump(path):
 
 def read_last_pts(path):
     """
-    快速读取 dump 文件最后一帧的 PTS。
-    策略：先读文件头获取 header_len，然后只扫描文件尾部 1MB 范围（覆盖最后 ~50 帧），
-    找到最后一帧的 [size, pts] 头，跳过其 data，拿到下一帧头 → 最后一帧的 pts。
-    返回 (last_pts, prev_pts) 或 None（无帧）。
+    读取 dump 文件最后一帧的 PTS。
+    策略：正向扫描所有帧头（跳过 data），返回最后一帧 PTS。
+    O(file_size) 但正确——原反向扫描在 frame data 中随机找 "看起来合法" 的 4 字节当 header，
+    返回垃圾 PTS（如 1.4e19 这种 >2^63 的值），触发 lib-monitor 的 pts-jump 误判。
+    返回 last_pts (int, us) 或 None。
     """
-    HEADER_MAGIC_SIZE = 12  # magic(4) + ver(1) + res(3) + header_len_le(4)
     FRAME_HDR_SIZE = 12    # size_le(4) + pts_le(8)
-    MAX_FRAME_SIZE = 2 * 1024 * 1024  # 2MB, h264 single frame 几乎不可能超过
-    TAIL_SCAN = 1024 * 1024  # 从尾部扫 1MB
+    MAX_FRAME_SIZE = 16 * 1024 * 1024  # 16MB,单帧不可能超过（sanity check 防越界）
 
     try:
         with open(path, 'rb') as f:
             magic = f.read(4)
             if magic not in (b'SDFV', b'SDFA'):
                 return None
-            version, _reserved = struct.unpack('<BBxxx', f.read(4))
+            version, _reserved = struct.unpack('<B3s', f.read(4))
+            data_start = 12  # HEADER_MAGIC_SIZE
             if magic == b'SDFV':
                 (header_len,) = struct.unpack('<I', f.read(4))
-                data_start = HEADER_MAGIC_SIZE + header_len
-            else:
-                data_start = HEADER_MAGIC_SIZE
+                data_start += header_len
 
-            file_size = f.seek(0, 2)  # 末尾
-            if file_size < data_start + FRAME_HDR_SIZE:
-                return None
-
-            # 读文件尾部 TAIL_SCAN 字节（不足则全读）
-            tail_size = min(TAIL_SCAN, file_size - data_start)
-            f.seek(file_size - tail_size)
-            tail = f.read(tail_size)
-
-            # 从尾往前扫：找最后一帧的 [size, pts]
-            # 帧头格式 [size:4][pts:8], 从某个 offset 开始每帧 12+size bytes
-            # 倒序：从 tail_size 往前找 size 字段（4 字节 LE），size 必须 <= MAX_FRAME_SIZE
-            pos = len(tail)
-            last_frame_pts = None
-            prev_frame_pts = None
-
-            # 从尾部往前逐帧反向扫描
-            # 边界处理：如果最后一帧不完整，会被部分读取。我们读 size 不合法就丢弃。
-            while pos > 0:
-                if pos < FRAME_HDR_SIZE:
+            f.seek(data_start)
+            last_pts = None
+            while True:
+                hdr = f.read(FRAME_HDR_SIZE)
+                if len(hdr) < FRAME_HDR_SIZE:
                     break
-                hdr_off = pos - FRAME_HDR_SIZE
-                size_bytes = tail[hdr_off:hdr_off+4]
-                if len(size_bytes) < 4:
-                    break
-                (frame_size,) = struct.unpack('<I', size_bytes)
-                if frame_size == 0 or frame_size > MAX_FRAME_SIZE:
-                    # size 无效 → 这个 hdr_off 不是真正的帧头，往前退 1 字节重试
-                    pos -= 1
-                    continue
-                # 读 pts
-                pts_bytes = tail[hdr_off+4:hdr_off+12]
-                if len(pts_bytes) < 8:
-                    break
-                (_, frame_pts) = struct.unpack('<IQ', tail[hdr_off:hdr_off+12])
-                if last_frame_pts is None:
-                    last_frame_pts = frame_pts
-                    prev_frame_pts = frame_pts
-                else:
-                    prev_frame_pts = frame_pts
-                # 往前退 12 + frame_size
-                pos = hdr_off - frame_size
-                if pos < 0:
-                    break
-                # 只拿最近两帧
-                if prev_frame_pts is not None and prev_frame_pts != last_frame_pts:
-                    break
-
-            return last_frame_pts
+                frame_size, pts_us = struct.unpack('<IQ', hdr)
+                # sanity check：frame_size 应是合理 H.264/AAC 帧大小
+                if frame_size <= 0 or frame_size > MAX_FRAME_SIZE:
+                    return last_pts  # 损坏了,返回到目前为止的 last_pts
+                # 跳过 frame data
+                f.seek(frame_size, 1)
+                last_pts = pts_us
+            return last_pts
     except (OSError, struct.error):
         return None
 
@@ -144,7 +109,7 @@ def detect_first_keyframe_index(sdfv_path: str) -> int:
         magic = f.read(4)
         if magic != b'SDFV':
             raise ValueError(f"Not SDFV file: {magic!r}")
-        version, _reserved = struct.unpack('<BBxxx', f.read(4))
+        version, _reserved = struct.unpack('<B3s', f.read(4))
         (header_len,) = struct.unpack('<I', f.read(4))
         if header_len > 0:
             f.seek(header_len, 1)

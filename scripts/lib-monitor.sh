@@ -62,10 +62,9 @@ _monitor_start_firefox() {
     setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
-        -no-session-restore \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \
         -remote-allow-origins '*' \
-        "$url" \
+        about:blank \
         < /dev/null > "$firefox_log" 2>&1 &
     local pid=$!
     disown
@@ -90,8 +89,10 @@ _monitor_wait_for_bidi() {
 # 启动 bidi daemon（unix socket）
 _monitor_daemon_start() {
     rm -f "$BIDI_SOCKET"
+    # 输出重定向到 /dev/null 防止 BiDi daemon 启动 JSON 泄漏到 monitor stdout
+    # 泄漏的 JSON（如 {"ok": true, "msg": "daemon ready"}）会污染 capture.sh 的 reason 解析
     setsid nohup "$BIDI_STATE" daemon --port "$MONITOR_BIDI_PORT" --socket "$BIDI_SOCKET" \
-        > /tmp/bidi-daemon.log 2>&1 &
+        >/dev/null 2>&1 &
     local pid=$!
     disown
     echo "$pid"
@@ -161,17 +162,18 @@ _monitor_wait_real_video() {
                     ;;
                 http://*|https://*)
                     # 真页面 URL，进一步等待视频元素 ready + 正在播放
-                    # 关键：必须检查 state==playing，避免暂停态/未点击播放时误判 ready
-                    # 同时需要 readyState>=2 且有 duration/currentTime
-                    # 放宽预热判定：只要 readyState>=2 且有 duration/currentTime 即可
-                    # 某些站点需用户点击才 playing，不应卡在预热阶段
+                    # 【严格判定】避免被 1-3 秒广告/预览误判为"真视频"：
+                    #   - readyState >= 2（有数据）
+                    #   - dur > 30s（真视频不可能 < 30s，广告/预览通常 5-15s）
+                    #   - cur > 1s（已经跳过了初始加载阶段）
+                    # 某些站点需用户点击才 playing，但 click 后 dur > 30 才算真视频 ready
                     if [ "$ready" -ge 2 ] &&
-                       [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
-                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ]; then
+                       [ "$(awk -v d="$dur" 'BEGIN{print (d>30)?1:0}')" = "1" ] &&
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>1)?1:0}')" = "1" ]; then
                         _monitor_log "   ✅ 真视频 ready: $url (ct=${cur}s dur=${dur}s ready=$ready state=$state)"
                         return 0
                     fi
-                    _monitor_debug "   preheat: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"
+                    _monitor_debug "   preheat: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 dur>30 + ct>1)"
                     ;;
                 *)
                     # 其他 URL（file:// 等），按 video metadata 兜底判定
@@ -214,15 +216,18 @@ _monitor_wait_real_video_manual() {
                     ;;
                 http://*|https://*)
                     # 真页面 URL，等待 playing
-                    # 放宽预热判定：只要 readyState>=2 且有 duration/currentTime 即可
-                    # 某些站点需用户点击才 playing，不应卡在预热阶段
+                    # 【严格判定】避免被 1-3 秒广告/预览误判为"真视频"：
+                    #   - readyState >= 2（有数据）
+                    #   - dur > 30s（真视频不可能 < 30s，广告/预览通常 5-15s）
+                    #   - cur > 1s（已经跳过了初始加载阶段）
+                    # 某些站点需用户点击才 playing，但 click 后 dur > 30 才算真视频 ready
                     if [ "$ready" -ge 2 ] &&
-                       [ "$(awk -v d="$dur" 'BEGIN{print (d>0)?1:0}')" = "1" ] &&
-                       [ "$(awk -v t="$cur" 'BEGIN{print (t>0)?1:0}')" = "1" ]; then
+                       [ "$(awk -v d="$dur" 'BEGIN{print (d>30)?1:0}')" = "1" ] &&
+                       [ "$(awk -v t="$cur" 'BEGIN{print (t>1)?1:0}')" = "1" ]; then
                         _monitor_log "   ✅ 真视频 ready: $url (ct=${cur}s dur=${dur}s ready=$ready state=$state)"
                         return 0
                     fi
-                    _monitor_debug "   preheat-manual: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 playing)"
+                    _monitor_debug "   preheat-manual: url=$url state=$state ready=$ready ct=${cur}s dur=${dur}s (等待 dur>30 + ct>1)"
                     ;;
                 *)
                     if [ "$ready" -ge 3 ] && \
@@ -289,6 +294,7 @@ monitor_run() {
     local state="init" ff_pid=""
     local end_reason="unknown"
     local is_resume=0
+    local prev_was_ended=0
 
     # Resume 检测
     if [ -f "$sidecar" ] && [ "$(jq -r '.interrupt_count' "$sidecar")" -gt 0 ]; then
@@ -315,89 +321,18 @@ monitor_run() {
     export MOZ_STREAM_DUMP_PATH="$dump_video"
     local daemon_pid=""
 
-    # 火狐预热：避免 about:home / 中间跳转页 / 广告等 "非真视频" 内容被 StreamDumper 先写进 dump。
-    # StreamDumper 是 firefox 进程内的 static 状态,首次触发的 SPS/PPS 一旦写入文件,整个 firefox
-    # 生命周期不再重写。真视频帧用错 SPS 解码失败 → mp4 时长错乱、音画不同步。
-    # 同时支持两种 URL 模式:
-    #   - http(s): URL 已知,firefox 启动后等到真视频 ready 即 kill+restart
-    #   - about:* (用户没传 URL,firefox 启动 about:home 等用户输入),firefox 启动后等到 URL=http(s) + 真视频 ready 才 kill+restart
-    #   - manual_url_mode=1 (Phase 1 手工 URL): 无限等待 state=playing,不超时 fallback
+    # 【v3.3 简化】去掉 preheat，只开一次 Firefox。
+    # 原 preheat 机制：开 Firefox#1（dump=/dev/null）等视频 ready，杀掉重开 Firefox#2（dump=真实文件）
+    # 原因：StreamDumper 首次写 SPS/PPS 后整个生命周期不再重写，避免抓 loading/ad 垃圾导致 SPS/PPS 错误。
+    # 现在接受这个风险（手动点击播放后只会抓到广告/预览的 SPS/PPS，但大多情况下和真视频 codec 一致不会出问题）
     local preheat_done=0
-    local preheat_timeout=90
-    if [[ "$url" == http://* || "$url" == https://* ]]; then
-        preheat_timeout=60  # URL 已知,真视频 ready 应该 30s 内
-    fi
-
-    # 手工 URL 模式：无限等待 playing，不设超时 fallback
     if [ "$manual_url_mode" = "1" ]; then
-        preheat_timeout=0  # 0 表示无限等待
-    fi
-
-    _monitor_log "🔥 预热 firefox（dump 临时写 /dev/null，等真视频 playing 后重启, 超时 ${preheat_timeout}s, 0=无限等待）"
-    export MOZ_STREAM_DUMP_PATH="/dev/null"
-
-    # 预热 firefox stdout/stderr 写到 LOG（这样 firefox 自己的错误信息能保留下来，便于排查）
-    # LOG 通过 MOZ_LOG_FILE env 传给 firefox（_monitor_start_firefox 第 4 参数）
-    local _preheat_log="${MOZ_LOG_FILE:-/tmp/firefox-stream-preheat.log}"
-    ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url" "$_preheat_log")
-    _monitor_log "   preheat firefox PID=$ff_pid log=$_preheat_log"
-
-    if _monitor_wait_for_bidi 30; then
-        daemon_pid=$(_monitor_daemon_start)
-        if _monitor_daemon_wait 15; then
-            if [ "$preheat_timeout" -eq 0 ]; then
-                # 手工模式：无限等待 playing
-                _monitor_log "   👆 手工 URL 模式：无限等待视频 playing..."
-                if _monitor_wait_real_video_manual; then
-                    preheat_done=1
-                    # 从 firefox 拿到用户实际 URL（可能与传入 url 不同，如重定向）
-                    local q
-                    q=$(_monitor_query 2>/dev/null)
-                    if [ -n "$q" ]; then
-                        local real_url
-                        real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
-                        if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
-                            _monitor_log "   ✅ 确认 URL: $real_url (原 url=$url)"
-                            url="$real_url"
-                        fi
-                    fi
-                fi
-            else
-                if _monitor_wait_real_video "$preheat_timeout"; then
-                    preheat_done=1
-                    # 如果 url 是 about:*,从 firefox 拿到用户实际输入的 URL
-                    if [[ "$url" == about:* ]]; then
-                        local q
-                        q=$(_monitor_query 2>/dev/null)
-                        if [ -n "$q" ]; then
-                            local real_url
-                            real_url=$(echo "$q" | jq -r '.url // empty' 2>/dev/null)
-                            if [[ "$real_url" == http://* || "$real_url" == https://* ]]; then
-                                _monitor_log "   ✅ 用户输入 URL: $real_url (原 url=$url)"
-                                url="$real_url"
-                            fi
-                        fi
-                    fi
-                else
-                    _monitor_log "   ⚠️  预热 ${preheat_timeout}s 未等到真视频 ready,继续主流程（dump 可能有污染）"
-                fi
-            fi
-        else
-            _monitor_log "   ⚠️  预热 daemon 未 ready,继续主流程"
-        fi
+        _monitor_log "👆 手工 URL 模式：URL 已传入，等网站自动播放"
     else
-        _monitor_log "   ⚠️  预热 firefox BiDi 未起来,继续主流程"
+        _monitor_log "🚀 启动 firefox 一次到位（dump 直接写真实文件，无 preheat）"
     fi
+    _monitor_log "   url=$url dump_v=$dump_video dump_a=$dump_audio"
 
-    _monitor_daemon_stop
-    kill -15 "$ff_pid" 2>/dev/null || true
-    sleep 1
-    kill -9 "$ff_pid" 2>/dev/null || true
-    ff_pid=""
-
-    # 恢复真 dump 路径,启动正式 firefox (用用户实际 URL)
-    export MOZ_STREAM_DUMP_PATH="$dump_video"
-    _monitor_log "🚀 启动 firefox 监控 url=$url（dump_v=$dump_video dump_a=$dump_audio）"
     ff_pid=$(_monitor_start_firefox "$ff_bin" "$profile" "$url")
     _monitor_log "   firefox PID=$ff_pid"
 
@@ -406,6 +341,19 @@ monitor_run() {
         kill -9 "$ff_pid" 2>/dev/null
         return 1
     fi
+
+    # 【v3.3 强制导航】Firefox 启动在 about:blank，现在用 BiDi 主动 navigate 到目标 URL。
+    # 用一次性 BiDi session（连上、navigate、关闭），不与下面 daemon 的常驻 session 冲突。
+    if [[ "$url" == http://* || "$url" == https://* ]]; then
+        _monitor_log "🔄 BiDi 一次性 navigate 到 URL..."
+        if python3 "${PROJECT_ROOT}/scripts/bidi-state.py" navigate "$url" --port "$MONITOR_BIDI_PORT" 2>/dev/null; then
+            _monitor_log "   ✅ BiDi navigate 成功"
+        else
+            _monitor_log "   ⚠️  BiDi navigate 失败（firefox 可能已在 URL上，继续）"
+        fi
+        sleep 3  # 等 navigate 生效 + 页面开始加载
+    fi
+
     _monitor_log "   启动 bidi daemon（socket=$BIDI_SOCKET）"
     daemon_pid=$(_monitor_daemon_start)
     if ! _monitor_daemon_wait 15; then
@@ -414,7 +362,7 @@ monitor_run() {
         kill -9 "$daemon_pid" 2>/dev/null
         return 1
     fi
-    _monitor_log "   daemon ready (PID=$daemon_pid), preheat_done=$preheat_done"
+    _monitor_log "   daemon ready (PID=$daemon_pid)"
 
     # Resume: seek 到断点
     if [ $is_resume -eq 1 ]; then
@@ -491,11 +439,14 @@ monitor_run() {
         ready_state=$(echo "$query_out" | jq -r '.readyState' 2>/dev/null)
 
         # --- 兜底：某些播放器不置 ended，用 currentTime 接近 duration 判定 ---
-        if [ "$video_state" != "ended" ] && [ "$duration" != "null" ] && [ -n "$duration" ] && [ "$duration" != "" ]; then
+        if [ "$video_state" = "ended" ]; then
+            prev_was_ended=1
+        elif [ "$video_state" != "ended" ] && [ "$duration" != "null" ] && [ -n "$duration" ] && [ "$duration" != "" ]; then
             local ct=${current_time:-0}
             local dur=${duration:-0}
             if [ "$(awk -v t="$ct" -v d="$dur" 'BEGIN{print (t >= d - 1)}')" = "1" ]; then
                 video_state="ended"
+                prev_was_ended=1
             fi
         fi
 
@@ -508,6 +459,11 @@ monitor_run() {
         # 如果不先 kill 就 mv，firefox 会把下一集内容写到 mv 后的 .p1.h264（同 inode）。
         local cur_ff_url
         cur_ff_url=$(echo "$query_out" | jq -r '.url // empty' 2>/dev/null)
+        # 调试：每轮 query 后打印 firefox 当前 URL（首次或变更时打，帮助诊断 URL 是否被加载）
+        if [ "$cur_ff_url" != "$last_ff_url" ] || [ "${DEBUG_URL_LOGGED:-0}" = "0" ]; then
+            _monitor_log "   🔍 firefox 当前 URL: ${cur_ff_url:-<空>}"
+            DEBUG_URL_LOGGED=1
+        fi
         local last_ff_url
         last_ff_url=$(jq -r '.last_ff_url // empty' "$sidecar" 2>/dev/null)
         local prev_pts_us
@@ -565,52 +521,65 @@ monitor_run() {
             sidecar_set "$sidecar" last_dump_pts_us "$cur_pts_us"
         fi
 
-        # 触发切集（OR 三个信号，不再需要 ct/duration 守卫）
+        # 触发切集（OR 三个信号: bidi next_episode / firefox URL 变化 / PTS 跳变）
+        # 三个信号都是权威的：要么是站点 JS 明确告知，要么是浏览器真实导航，要么是 dump 文件 PTS 回跳
+        # 不需要 ct/duration 守卫：它们都被设计成只在"新内容出现"时才触发
         if [ -n "$next_ep_url" ]; then
-            # 守卫：如果视频已 ended（正常播放结束），不要当作 next_episode
-            if [ "$video_state" = "ended" ]; then
-                _monitor_debug "⏭️  video_state=ended，走 ended 分支而非 next_episode ($next_ep_source)"
+            # 例外 1：如果视频刚 ended 且 firefox URL 还没变（页面刚播完但还未跳转），不要切集
+            # 这时走 ended 分支正常结束，捕获最后一帧
+            if [ "$video_state" = "ended" ] && [ "$cur_ff_url" = "$last_ff_url" ]; then
+                _monitor_debug "⏭️  video_state=ended 且 URL 未变，走 ended 分支 ($next_ep_source: $next_ep_url)"
             else
-                _monitor_log "⏭️  检测到下一集 ($next_ep_source): $next_ep_url"
-                sidecar_set "$sidecar" next_url "$next_ep_url"
-                sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
-                sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
-                sidecar_set "$sidecar" last_dump_pts_us "0"  # 重置，新集重新建立基线
+                # 真切集信号：触发 roll
+                # - bidi next_episode_url: 站点 JS 明确告知下一集 URL
+                # - firefox-url: URL 栏变化 = 真实浏览器导航（新页面加载）
+                # - pts-jump: dump 文件 PTS 回跳 = 新帧内容
+                # 当前 current_time=0 不是"未播放"，而是"新页面刚加载新 video 元素"
+                _do_next_episode_roll=1
+                prev_was_ended=0
 
-                # 先 kill firefox 释放 StreamDumper sFile fd，避免下一集内容污染当前集 dump
-                _monitor_log "   停止 firefox 准备滚动 dump..."
-                _monitor_daemon_stop
-                if [ -n "$ff_pid" ]; then
-                    kill -15 "$ff_pid" 2>/dev/null || true
-                    sleep 1
-                    kill -9 "$ff_pid" 2>/dev/null || true
-                    ff_pid=""
-                fi
+                if [ "${_do_next_episode_roll:-0}" = "1" ]; then
+                    _monitor_log "⏭️  检测到下一集 ($next_ep_source): $next_ep_url"
+                    sidecar_set "$sidecar" next_url "$next_ep_url"
+                    sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
+                    sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
+                    sidecar_set "$sidecar" last_dump_pts_us "0"  # 重置，新集重新建立基线
 
-                # 手写 mv（不调 _monitor_roll_dump：它的 echo 是函数返回值，会污染 stdout 进而污染 monitor_run 返回的字符串）
-                local _roll_base="${dump_video%.h264}"
-                if [ -f "$dump_video" ]; then
-                    local _end_time
-                    _end_time=$(jq -r '.current_time' "$sidecar" 2>/dev/null)
-                    sidecar_add_part "$sidecar" "$dump_video" \
-                        "$(jq -r '.last_keyframe_pts' "$sidecar" 2>/dev/null)" "$_end_time" 2>/dev/null || true
-                    mv "$dump_video" "${_roll_base}.p1.h264"
-                    dump_video="${_roll_base}.p1.h264"
-                fi
-                if [ -f "$dump_audio" ]; then
-                    local _end_time
-                    _end_time=$(jq -r '.current_time' "$sidecar" 2>/dev/null)
-                    sidecar_add_part "$sidecar" "$dump_audio" \
-                        "$(jq -r '.last_keyframe_pts' "$sidecar" 2>/dev/null)" "$_end_time" 2>/dev/null || true
-                    mv "$dump_audio" "${_roll_base}.p1.aac"
-                    dump_audio="${_roll_base}.p1.aac"
-                fi
-                if [ -f "${_roll_base}.log" ]; then
-                    mv "${_roll_base}.log" "${_roll_base}.p1.log"
-                fi
+                    # 先 kill firefox 释放 StreamDumper sFile fd，避免下一集内容污染当前集 dump
+                    _monitor_log "   停止 firefox 准备滚动 dump..."
+                    _monitor_daemon_stop
+                    if [ -n "$ff_pid" ]; then
+                        kill -15 "$ff_pid" 2>/dev/null || true
+                        sleep 1
+                        kill -9 "$ff_pid" 2>/dev/null || true
+                        ff_pid=""
+                    fi
 
-                end_reason="next_episode"
-                break
+                    # 手写 mv（不调 _monitor_roll_dump：它的 echo 是函数返回值，会污染 stdout 进而污染 monitor_run 返回的字符串）
+                    local _roll_base="${dump_video%.h264}"
+                    if [ -f "$dump_video" ]; then
+                        local _end_time
+                        _end_time=$(jq -r '.current_time' "$sidecar" 2>/dev/null)
+                        sidecar_add_part "$sidecar" "$dump_video" \
+                            "$(jq -r '.last_keyframe_pts' "$sidecar" 2>/dev/null)" "$_end_time" 2>/dev/null || true
+                        mv "$dump_video" "${_roll_base}.p1.h264"
+                        dump_video="${_roll_base}.p1.h264"
+                    fi
+                    if [ -f "$dump_audio" ]; then
+                        local _end_time
+                        _end_time=$(jq -r '.current_time' "$sidecar" 2>/dev/null)
+                        sidecar_add_part "$sidecar" "$dump_audio" \
+                            "$(jq -r '.last_keyframe_pts' "$sidecar" 2>/dev/null)" "$_end_time" 2>/dev/null || true
+                        mv "$dump_audio" "${_roll_base}.p1.aac"
+                        dump_audio="${_roll_base}.p1.aac"
+                    fi
+                    if [ -f "${_roll_base}.log" ]; then
+                        mv "${_roll_base}.log" "${_roll_base}.p1.log"
+                    fi
+
+                    end_reason="next_episode"
+                    break
+                fi
             fi
         fi
         # 更新 sidecar

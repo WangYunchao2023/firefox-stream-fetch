@@ -1,14 +1,24 @@
-# Firefox Stream Fetch v1.1.0
-# Override Wayland default: force X11-only explicitly
+# Firefox Stream Fetch — 本地开发 mozconfig
+# 注意：不要 source firefox/build/mozconfig.common，那是 Mozilla CI 专用
 
-# Set PERFHERDER_EXTRA_OPTIONS to "x11" so mozconfig.linux uses x11-only
-export PERFHERDER_EXTRA_OPTIONS=x11
+# 跳过 toolchain 自动更新（我们的 firefox 打了补丁，artifact 哈希对不上官方 CI）
+ac_add_options --enable-bootstrap=no-update
 
-# Source the standard linux mozconfig which will use x11-only
-. "$topsrcdir/build/mozconfig.common"
+# 不构建 wasm sandboxed-libraries（避免 wasi-sdk 缺 libgcc 探测失败）
+ac_add_options --without-wasm-sandboxed-libraries
 
-# After sourcing common, override any settings
+# 基础构建选项（webrender 是默认，无需 flag）
 ac_add_options --enable-optimize="-O2 -march=native"
+ac_add_options --disable-debug
 ac_add_options --enable-release
-ac_add_options --enable-webrender
-ac_add_options --enable-eme=wpe
+
+# Widevine CDM 支持（firefox-stream-fetch 的核心需求）
+# Widevine CDM（注意：值是 widevine 不是 wpe）
+ac_add_options --enable-eme=widevine
+
+# X11 backend（避免 Wayland 兼容问题）
+export MOZ_ENABLE_WAYLAND=0
+export GDK_BACKEND=x11
+
+# 应用图标（Nightly branding，让 capture.sh 的窗口标题匹配 "Nightly"）
+ac_add_options --with-branding=browser/branding/nightly
