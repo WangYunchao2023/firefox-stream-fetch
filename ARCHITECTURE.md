@@ -1,7 +1,7 @@
 # firefox-stream-fetch 架构文档
 
 > 记录本项目的组件划分、数据流、关键设计决策。
-> 最后更新：2026-07-30（v3.2）
+> 最后更新：2026-07-31（v4.0.0）
 
 ---
 
@@ -249,7 +249,8 @@ firefox-stream-fetch/
 │   ├── 0002-add-av1-support.patch   # v1.1.0：codec dispatch（HEVC/AV1）
 │   ├── 0003-codec-aware-output.patch# v1.1.0：IVF 容器 + 自动后缀
 │   ├── 0004-add-audio-dump.patch    # v2.1.0：AAC 音频 dump
-│   └── 0005-stream-source-tracking.patch # v3.2：预热跳过 + stream reset
+│   ├── 0005-stream-source-tracking.patch    # v3.2：预热跳过 + stream reset
+│   └── 0006-add-pts-dump.patch              # v4.0.0：独立 PTS dump (PTSDumpLogger)
 │
 ├── scripts/                     # 运行时脚本
 │   ├── capture.sh               # ★ 统一入口（Phase 1 + Phase 2 + mux）
@@ -311,6 +312,11 @@ firefox-stream-fetch/
   ▼ 0005 (v3.2)
 + 预热跳过（前 30 个 sample）
 │  └─ stream state 声明提升 + gAudioDumpFile
+│
+  ▼ 0006 (v4.0.0)
++ PTSDumpLogger：独立每帧 PTS dump
+│  └─ `MOZ_STREAM_DUMP_PTS_FILE` 环境变量驱动
+│  └─ TSV 纯文本输出，fflush 实时写入
 │
 最终编译
 ```

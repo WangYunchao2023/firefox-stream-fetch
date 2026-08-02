@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v3.6 统一入口
+# firefox-stream-fetch capture.sh — v4.0.0 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -35,7 +35,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="$HOME/Videos/firefox抓取"
 AUTO_NEXT=0
 SKIP_PHASE1=0
-KEEP_H264=0
+KEEP_H264=1
 URL=""
 PROFILE_PATH=""
 
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v3.6
+firefox-stream-fetch 统一抓取脚本 v4.0.0
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -745,6 +745,11 @@ EP
     source "$SCRIPT_DIR/lib-monitor.sh"
 
     # Phase 2 必须 export MOZ_STREAM_DUMP_PATH 给 StreamDumper（Phase 1 设为 /dev/null）
+
+    # .pts 文本文件默认保存到与 mp4 同一目录
+    PTS_FILE="${OUTPUT_DIR}/pts_$(basename "${DUMP_FILE%.*}").pts"
+    echo "📎 PTS dump: $PTS_FILE (MOZ_STREAM_DUMP_PTS_FILE)"
+    export MOZ_STREAM_DUMP_PTS_FILE="$PTS_FILE"
     export MOZ_STREAM_DUMP_PATH="$DUMP_FILE"
     # 预热 firefox stdout/stderr 写到 $LOG（让 firefox 自己的错误信息能保留）
     export MOZ_LOG_FILE="$LOG"
@@ -1065,7 +1070,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v3.6                                ║"
+    echo "║  firefox-stream-fetch v4.0.0                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"

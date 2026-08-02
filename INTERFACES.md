@@ -49,11 +49,65 @@ static void DumpAudio(MediaRawData* aSample, const TrackInfo* aInfo);
 - 使用 Mozilla 内置 `ADTS::ConvertSample()` 包装 AAC
 - 输出到全局 `gAudioDumpFile`（非函数局部 static）
 
-### 1.3 环境变量接口
+### 1.3 PTSDumpLogger（v4.0.0 新增 · v4.1 分文件）
+
+**位置：** `firefox/dom/media/MediaFormatReader.cpp`，匿名命名空间内
+
+```cpp
+class PTSDumpLogger {
+ private:
+  static void SplitPaths(const char* basePath, char (&videoPath)[512],
+                         char (&audioPath)[512]);
+ public:
+  static void Log(TrackType aTrack, const MediaRawData* aSample);
+};
+```
+
+**调用时机：** `StreamDumper::Dump()` 入口 — **warmup skip 之前**、codec dispatch 之前。
+每帧都经过此处，因此所有帧（含预热丢弃帧）的 PTS 都会被记录，并路由到对应 track 的文件。
+
+**触发方式：**
+- **默认**：`capture.sh` 自动导出 `$PTS_FILE`（如 `$OUTPUT_DIR/pts_<name>.pts`），实际生成两个文件：
+  - `<base>.pts` → **视频 PTS**（仅视频帧）
+  - `<base>_audio.pts` → **音频 PTS**（仅音频帧）
+- **手动**：设置环境变量 `MOZ_STREAM_DUMP_PTS_FILE=/自定义路径/dump.pts`，同样生成两个分文件
+- 未设置 → 零开销（仅一次 getenv + branch 判断）
+- 已设置 → lazy open：首次遇到某 track 类型时打开对应文件（行缓冲）
+
+**输出格式（纯文本 TSV，每文件独立）：**
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| pts_us | uint64 | mTime.ToMicroseconds()，demuxer 输出的原始 PTS |
+| duration_us | uint64 | mDuration.ToMicroseconds()（IsPositive 时才非零） |
+| size | uint32 | aSample->Size() |
+| keyframe | int32 | mKeyframe.value_or(false) ? 1 : 0 |
+| offset | int64 | aSample->mOffset |
+
+> **v4.1 变更**：track_type 列已移除——文件名本身就说明了 track 类型。解析更简单：read `.pts` 就是视频，读 `_audio.pts` 就是音频。
+
+**示例输出：**
+
+视频文件 `pts_video.pts`：
+```
+# pts_us	 duration_us	 size	 keyframe	 offset
+0	33333	12345	1	0
+33333	33333	8765	0	12345
+```
+
+音频文件 `pts_audio.pts`：
+```
+# pts_us	 duration_us	 size	 keyframe	 offset
+23229	23229	8192	0	0
+46458	23229	4096	0	8192
+```
+
+### 1.4 环境变量接口
 
 | 变量 | 读/写 | 说明 |
 |---|---|---|
 | `MOZ_STREAM_DUMP_PATH` | 读 | dump 输出路径；空值或未设则用默认 |
+| `MOZ_STREAM_DUMP_PTS_FILE` | 读（v4.1） | PTS dump 基础路径；设置后自动生成视频+音频两个 `.pts` 文件，空值或未设则禁用 |
 
 **注意：** capture.sh Phase 1 设为 `/dev/null`，Phase 2 设为实际路径。
 

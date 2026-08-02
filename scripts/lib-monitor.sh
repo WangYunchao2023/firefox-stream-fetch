@@ -59,7 +59,7 @@ _monitor_start_firefox() {
                 ;;
         esac
     fi
-    setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" "$ff_bin" \
+    setsid nohup env MOZ_STREAM_DUMP_PATH="$MOZ_STREAM_DUMP_PATH" MOZ_STREAM_DUMP_PTS_FILE="$MOZ_STREAM_DUMP_PTS_FILE" "$ff_bin" \
         -profile "$profile" \
         -no-remote --new-instance \
         -remote-debugging-port "$MONITOR_BIDI_PORT" \

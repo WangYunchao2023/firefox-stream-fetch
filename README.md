@@ -50,6 +50,27 @@ firefox-stream-fetch/
 
 ## 版本记录
 
+### v4.0.0 (2026-07-31)
+
+**新增独立 PTS dump — PTSDumpLogger + 环境变量驱动**
+
+| 维度 | 内容 |
+|---|---|
+| **核心能力** | `PTSDumpLogger` 类，每帧原始 PTS/TIMESTAMP 写入纯文本 TSV 文件 |
+| **触发方式** | `MOZ_STREAM_DUMP_PTS_FILE=/path/to/dump.pts` 环境变量 |
+| **输出格式** | 纯文本 TSV，视频/音频分文件；列：`pts_us \t duration_us \t size \t keyframe \t offset` |
+| **路径规则** | `dump.pts` → 视频 `dump.pts` + 音频 `dump_audio.pts` |
+| **调用时机** | `StreamDumper::Dump()` 入口（warmup skip 之前），捕获所有帧包括预热丢弃帧 |
+| **安全性** | 完全独立新类，不修改任何现有 static state；未设置 env 时零开销（仅 getenv + branch） |
+| **补丁** | `patches/0006-add-pts-dump.patch` |
+
+**使用示例：**
+```bash
+export MOZ_STREAM_DUMP_PTS_FILE=/tmp/my_video.pts
+firefox --no-remote -P default-release -no-remote ...
+mux_with_pts.py my_video.raw my_video.pts out.mp4   # raw+pts → mp4
+```
+
 ### v3.5.0 (2026-07-30)
 
 **文档化 + 架构/接口文档**

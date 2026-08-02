@@ -127,8 +127,8 @@ def _build_query_fn(video_selector=None):
   const urlChanged = curUrl !== last.url;
   const srcChanged = curSrc && curSrc !== last.src;
   let nextEpisodeUrl = null;
-  // Guard: avoid false positives from preload / quality switch (need >30s played and duration >60s)
-  if (urlChanged && srcChanged && v.readyState >= 2 && v.currentTime > 30 && v.duration > 60) {{
+  // URL + src 同时变化即判定为切集，无需 currentTime/duration 守卫
+  if (urlChanged && srcChanged && v.readyState >= 2) {{
     state = 'next_episode';
     nextEpisodeUrl = curUrl;
   }}

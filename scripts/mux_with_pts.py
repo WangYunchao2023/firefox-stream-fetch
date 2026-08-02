@@ -16,6 +16,7 @@ Usage:
 """
 import sys
 import os
+import struct
 import argparse
 
 # 确保 user site-packages 在 sys.path（conda base 会设 PYTHONNOUSERSITE=1，导致 pip 安装的 av 找不到）
@@ -42,9 +43,130 @@ def read_pts(pts_file):
     return pts_list
 
 
-def mux_video(prefix, pts_file, raw_file, out_path, rebase_at_first_keyframe=False, first_keyframe_idx=-1, audio_duration_us=0):
+def pts_jump_drop_offset_from_dump(sdfv_path, drop_index, threshold_us=500_000):
+    """Find byte offset of frame [drop_index] in SDFV dump file.
+
+    Reads the original SDFV dump (which has per-frame size fields) and returns
+    the cumulative byte offset at which frame [drop_index] begins.
+    Returns -1 on error.
+    """
+    FRAME_HDR_SIZE = 12  # frame_size_le(4) + pts_le(8)
+    with open(sdfv_path, 'rb') as f:
+        magic = f.read(4)
+        if magic == b'SDFV':
+            f.read(4)  # version + reserved
+            hdr_len_bytes = f.read(4)
+            if len(hdr_len_bytes) < 4:
+                return -1
+            header_len = struct.unpack('<I', hdr_len_bytes)[0]
+            if header_len > 0:
+                f.seek(header_len, 1)
+        elif magic == b'SDFA':
+            f.read(4)  # version + reserved
+        else:
+            return -1
+
+        offset = 0
+        for i in range(drop_index):
+            hdr = f.read(FRAME_HDR_SIZE)
+            if len(hdr) < FRAME_HDR_SIZE:
+                return -1
+            frame_size, _pts = struct.unpack('<IQ', hdr)
+            offset += FRAME_HDR_SIZE + frame_size
+            f.seek(frame_size, 1)
+        return offset
+
+
+def find_pts_jump_drop(raw_file, pts_list, dump_path=None, threshold_us=500_000):
+    """Scan pts_list for backward PTS jumps and compute byte offset.
+
+    Returns (drop_index, drop_offset_in_raw) where:
+      - drop_index: first frame whose PTS is significantly lower than previous
+      - drop_offset_in_raw: byte offset in .raw file BEFORE the drop frame
+        (sum of sizes of all frames before drop_index)
+
+    If dump_path is provided, uses SDFV per-frame size fields for precision.
+    Otherwise scans raw file for H.264/HEVC start codes (less reliable).
+
+    A backward jump means: pts[i] < pts[i-1] AND the drop is large
+    (>= threshold_us, default 0.5s to avoid noise from normal PTS jitter).
+    
+    Note: instead of stopping at the first backward jump (which may be MSE buffer
+    jitter), we scan the entire list and pick the largest backward jump. This
+    ensures a massive next_episode PTS reset (~300s+) beats smaller jitters (<5s).
+    """
+    if len(pts_list) < 2:
+        return -1, 0
+
+    drop_index = -1
+    max_drop_us = 0
+    for i in range(1, len(pts_list)):
+        prev_pts = pts_list[i - 1]
+        cur_pts = pts_list[i]
+        # 向后跳变：当前 PTS < 前一帧 且 落差超过阈值
+        if cur_pts < prev_pts and (prev_pts - cur_pts) >= threshold_us:
+            jump_us = prev_pts - cur_pts
+            if jump_us > max_drop_us:
+                max_drop_us = jump_us
+                drop_index = i
+
+    if drop_index < 0:
+        return -1, 0
+
+    # 优先用原始 SDFV dump 文件（有 per-frame size 字段）精确计算偏移
+    if dump_path and os.path.isfile(dump_path):
+        offset = pts_jump_drop_offset_from_dump(dump_path, drop_index)
+        if offset >= 0:
+            return drop_index, offset
+
+    # Fallback: 从 .raw 扫描 NAL start code（不精确，仅当 dump 丢失时）
+    FRAME_HDR_SIZE = 12
+    with open(raw_file, 'rb') as f:
+        magic = f.read(4)
+        skip = 0
+        if magic == b'SDFV':
+            f.read(4)  # version + reserved
+            hdr_len_bytes = f.read(4)
+            if len(hdr_len_bytes) < 4:
+                return -1, 0
+            header_len = struct.unpack('<I', hdr_len_bytes)[0]
+            if header_len > 0:
+                f.seek(header_len, 1)  # skip SPS/PPS header
+                skip += header_len
+        elif magic == b'SDFA':
+            print(f"video: PTS 跳变检测：音频模式不支持 .raw 帧截断",
+                  file=sys.stderr)
+            return -1, 0
+        else:
+            return -1, 0  # unknown format
+
+        # 跳过前 drop_index 帧，累积字节偏移
+        offset = 0
+        frames_scanned = 0
+        while frames_scanned < drop_index:
+            chunk = f.read(65536)
+            if not chunk:
+                break
+            sc_pos = chunk.find(b'\x00\x00\x01')
+            if sc_pos < 0:
+                sc_pos = chunk.find(b'\x00\x00\x00')
+            if sc_pos >= 0:
+                # start code 标志着新 NALU 起始 → 当前 NALU 结束
+                offset += sc_pos
+                frames_scanned += 1
+                # 继续扫描下一个 NALU（可能在同批次剩余数据中）
+            else:
+                # 当前批次无 start code，整个批次属于同一帧
+                offset += len(chunk)
+
+    return drop_index, offset
+
+
+def mux_video(prefix, pts_file, raw_file, out_path, dump_file=None,
+              rebase_at_first_keyframe=False, first_keyframe_idx=-1, audio_duration_us=0):
     """Mux H.264/HEVC raw stream with per-frame PTS → mp4.
 
+    dump_file: original SDFV dump path (used for precise byte offset calc).
     audio_duration_us: if > 0, use this as the canonical playback duration
         (computed from AAC frame count). Video frame_duration = audio_duration / n_frames.
         This forces A/V sync and works even when firefox's per-frame PTS is broken.
@@ -53,6 +175,19 @@ def mux_video(prefix, pts_file, raw_file, out_path, rebase_at_first_keyframe=Fal
     if not pts_list:
         print(f"ERROR: no PTS in {pts_file}", file=sys.stderr)
         return False
+
+    # PTS 跳变截断：检测并截掉 next_episode 残留帧
+    # 必须在 PTS 重算之前执行——否则 audio-clock 会把 PTS 线性化，掩盖跳变
+    drop_idx, drop_offset = find_pts_jump_drop(raw_file, pts_list,
+                                                dump_path=dump_file)
+    if drop_idx > 0 and drop_offset > 0:
+        print(f"video: PTS 跳变检测 (drop@frame={drop_idx}, offset={drop_offset}B)，截断...",
+              file=sys.stderr)
+        with open(raw_file, 'r+b') as f:
+            f.truncate(drop_offset)
+        pts_list = pts_list[:drop_idx]
+        print(f"video: 截断后剩余 {len(pts_list)} 帧",
+              file=sys.stderr)
 
     # 检查 PTS 是否可信：span < n_frames/30 秒说明 PTS 过密（firefox MSE 的 mTime 不可信）
     # 优先用音频时长推算视频帧间隔（最准，audio as clock），否则用相邻 PTS 差值中位数
@@ -106,8 +241,6 @@ def mux_video(prefix, pts_file, raw_file, out_path, rebase_at_first_keyframe=Fal
 
     pts_idx = 0
     for packet in input_container.demux(in_stream):
-        if pts_idx >= len(pts_list):
-            break
         if packet.size == 0:
             continue
         # Set PTS from our .pts file (microseconds)

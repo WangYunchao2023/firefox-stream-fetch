@@ -1,0 +1,143 @@
+From: WangYunchao <wangyc@local>
+Subject: [PATCH] feat: PTSDumpLogger — 独立每帧 PTS dump（视频/音频分文件）
+
+在匿名命名空间中新增 PTSDumpLogger 类，由环境变量
+MOZ_STREAM_DUMP_PTS_FILE=/path/to/dump.pts 控制开启。
+
+**v4.1 变更**：视频和音频 PTS 数据分别写入两个文件，不再混排在一个文件中。
+- 路径规则：`foo.pts` → `foo.pts`（视频）+ `foo_audio.pts`（音频）
+- 视频文件仅含视频帧，音频文件仅含音频帧
+- 每列格式：`pts_us\tduration_us\tsize\tkeyframe\toffset`（track_type 已由文件名体现）
+
+每次 StreamDumper::Dump() 被调用（即每个 demuxed sample）都会记录对应帧的 PTS 信息。
+
+输出为纯文本 TSV 格式，fflush 保证实时写入。未设置环境变量时零开销
+（仅一次 getenv + branch）。
+
+此功能独立于现有 SDFV/SDFA dump，不修改任何已有 static state 或 codec dispatch。
+
+diff --git a/dom/media/MediaFormatReader.cpp b/dom/media/MediaFormatReader.cpp
+--- a/dom/media/MediaFormatReader.cpp
++++ b/dom/media/MediaFormatReader.cpp
+@@ -82,6 +82,97 @@ namespace mozilla {
+ // Lives for the program's lifetime; initialized to nullptr.
+ FILE* gAudioDumpFile = nullptr;
+ 
++// ============================================================================
++// PTSDumpLogger: capture raw per-frame PTS data — video and audio into
++// separate files.  Triggered by setting MOZ_STREAM_DUMP_PTS_FILE env var.
++// If the path ends with ".pts", two files are created:
++//   <path>       → video.pts   (track_type=1)
++//   <path>_audio → audio.pts   (track_type=2)
++// Output format (one line per frame):
++//   pts_us\t duration_us\t size\t keyframe\t offset
++// (track_type is implicit: file name tells you which)
++// ============================================================================
++class PTSDumpLogger {
++ private:
++  // Derive separate paths for video vs audio from a single base path.
++  // "foo.pts"         → video="foo.pts",        audio="foo_audio.pts"
++  // "foo_pts"         → video="foo_pts",        audio="foo_pts_audio"
++  static void SplitPaths(const char* basePath, char (&videoPath)[512],
++                         char (&audioPath)[512]) {
++    snprintf(videoPath, sizeof(videoPath), "%s", basePath);
++    // Find last '.' to insert _audio before extension
++    const char* dot = strrchr(basePath, '.');
++    if (dot && (dot - basePath) > 4) {
++      size_t prefixLen = static_cast<size_t>(dot - basePath);
++      snprintf(audioPath, sizeof(audioPath), "%.*s_audio%s",
++               int(prefixLen), basePath, dot);
++    } else {
++      snprintf(audioPath, sizeof(audioPath), "%s_audio", basePath);
++    }
++  }
++ public:
++  static void Log(mozilla::TrackInfo::TrackType aTrack,
++                  const mozilla::MediaRawData* aSample) {
++    if (!aSample) return;
++    const char* base = std::getenv("MOZ_STREAM_DUMP_PTS_FILE");
++    if (!base || !*base) return;
++
++    // Lazy-open per-track file on first access of that track type.
++    static FILE* sVideoPtsFile = nullptr;
++    static FILE* sAudioPtsFile = nullptr;
++    static bool sPathsResolved = false;
++    char vPath[512] = {0};
++    char aPath[512] = {0};
++
++    if (!sPathsResolved) {
++      SplitPaths(base, vPath, aPath);
++      sPathsResolved = true;
++    }
++
++    uint64_t timeUs   = (uint64_t)aSample->mTime.ToMicroseconds();
++    uint64_t durUs    = (aSample->mDuration.IsPositive())
++                          ? (uint64_t)aSample->mDuration.ToMicroseconds()
++                          : 0;
++    int32_t  keyframe = aSample->mKeyframe.isSome() && aSample->mKeyframe.value()
++                          ? 1 : 0;
++    int64_t  offset   = aSample->mOffset;
++
++    if (aTrack == mozilla::TrackInfo::kVideoTrack) {
++      if (!sVideoPtsFile) {
++        sVideoPtsFile = std::fopen(vPath, "w");
++        if (!sVideoPtsFile) {
++          std::fprintf(stderr,
++                       "[PTSDumpLogger] failed to open video pts %s (errno=%d %s), disabled\n",
++                       vPath, errno, std::strerror(errno));
++          return;
++        }
++        std::setvbuf(sVideoPtsFile, nullptr, _IOLBF, 0);
++        std::fprintf(sVideoPtsFile,
++                     "# pts_us\t duration_us\t size\t keyframe\t offset\n");
++        std::fprintf(stderr, "[PTSDumpLogger] writing VIDEO PTS data to %s\n", vPath);
++      }
++      fprintf(sVideoPtsFile, "%llu\t%llu\t%u\t%d\t%lld\n",
++              (unsigned long long)timeUs,
++              (unsigned long long)durUs,
++              (unsigned int)aSample->Size(),
++              keyframe,
++              (long long)offset);
++      fflush(sVideoPtsFile);
++    } else { // audio
++      if (!sAudioPtsFile) {
++        sAudioPtsFile = std::fopen(aPath, "w");
++        if (!sAudioPtsFile) {
++          std::fprintf(stderr,
++                       "[PTSDumpLogger] failed to open audio pts %s (errno=%d %s), disabled\n",
++                       aPath, errno, std::strerror(errno));
++          return;
++        }
++        std::setvbuf(sAudioPtsFile, nullptr, _IOLBF, 0);
++        std::fprintf(sAudioPtsFile,
++                     "# pts_us\t duration_us\t size\t keyframe\t offset\n");
++        std::fprintf(stderr, "[PTSDumpLogger] writing AUDIO PTS data to %s\n", aPath);
++      }
++      fprintf(sAudioPtsFile, "%llu\t%llu\t%u\t%d\t%lld\n",
++              (unsigned long long)timeUs,
++              (unsigned long long)durUs,
++              (unsigned int)aSample->Size(),
++              keyframe,
++              (long long)offset);
++      fflush(sAudioPtsFile);
++    }
++  }
++};
++}  // anonymous namespace
++
+ class StreamDumper {
+  public:
+   static void Dump(mozilla::TrackInfo::TrackType aTrack,
+@@ -97,6 +188,12 @@ class StreamDumper {
+     ++sCallCount;
+     if (!aSample) return;
+ 
++    // PTSDumpLogger: capture raw per-frame PTS at demuxer output.
++    // Placed here (before warmup skip / codec dispatch) so ALL frames
++    // — including warmup and discarded ones — are recorded for analysis.
++    PTSDumpLogger::Log(aTrack, aSample);
++
++    // End of PTSDumpLogger block
+     if (aTrack == mozilla::TrackInfo::kAudioTrack) {
+       DumpAudio(aSample, aInfo);
+       return;
