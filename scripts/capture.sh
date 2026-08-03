@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.0.0 统一入口
+# firefox-stream-fetch capture.sh — v4.2.0 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.0.0
+firefox-stream-fetch 统一抓取脚本 v4.2.0
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -1070,7 +1070,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.0.0                              ║"
+    echo "║  firefox-stream-fetch v4.2.0                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
@@ -1118,6 +1118,15 @@ main() {
         fi
         break
     done
+
+    # 抓取完成后二次处理：把视频 .pts 按用户要求的列格式整理
+    # （drop offset, rename frame_index→dts_order, 列重排, 跳变切段, 段内升序, 加 frame_No#）
+    # 只处理视频，音频 .pts 不动；输出 <base>.final.pts，原文件保留
+    if [ -n "${PTS_FILE:-}" ] && [ -s "$PTS_FILE" ]; then
+        echo ""
+        echo "🔧 二次处理视频 .pts (pts_finalize.py) ..."
+        python3 "${SCRIPT_DIR}/pts_finalize.py" "$PTS_FILE" 2>&1 | sed 's/^/  /'
+    fi
 
     # 清理（除非 --keep-h264）
     if [ $KEEP_H264 -eq 0 ]; then
