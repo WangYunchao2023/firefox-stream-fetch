@@ -226,6 +226,19 @@ def mux_video(prefix, pts_file, raw_file, out_path, dump_file=None,
         pts_list = pts_list[first_keyframe_idx:]
         print(f"video: rebased PTS, dropped {first_keyframe_idx} pre-keyframe frames, base_pts={base_pts}us", file=sys.stderr)
 
+    # === Build monotonic DTS list ===
+    # H.264 有 B 帧，dump 顺序（DTS）≠ 显示顺序（PTS），所以 pts_list 不单调。
+    # mp4 muxer 要求 DTS 单调。原代码把 DTS 也设成 pts_list 导致 PyAV EINVAL。
+    # 这里单独算一组单调 DTS（DTS[i] = i * avg_frame_dur），DTS 与 PTS 各自的语义
+    # 独立：mp4 stts 用 DTS（解码序），ctts 用 PTS-DTS（显示偏移），都允许。
+    n_frames = len(pts_list)
+    if n_frames > 1:
+        span_us_now = max(pts_list) - min(pts_list)
+        avg_frame_dur_us = max(1, span_us_now // (n_frames - 1))
+    else:
+        avg_frame_dur_us = 40000  # fallback 25fps
+    dts_list = [int(i * avg_frame_dur_us) for i in range(n_frames)]
+
     # Open input raw stream (auto-detect H.264/HEVC)
     input_container = av.open(raw_file, mode='r')
     in_stream = input_container.streams.video[0]
@@ -243,9 +256,10 @@ def mux_video(prefix, pts_file, raw_file, out_path, dump_file=None,
     for packet in input_container.demux(in_stream):
         if packet.size == 0:
             continue
-        # Set PTS from our .pts file (microseconds)
+        # PTS = 原始（显示序，可能不单调 — B 帧重排产物）
         packet.pts = pts_list[pts_idx]
-        packet.dts = pts_list[pts_idx]
+        # DTS = 单调（解码序）— mp4 muxer 硬要求
+        packet.dts = dts_list[pts_idx]
         packet.stream = out_stream
         output.mux(packet)
         pts_idx += 1
