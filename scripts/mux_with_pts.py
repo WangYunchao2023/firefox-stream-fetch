@@ -18,6 +18,7 @@ import sys
 import os
 import struct
 import argparse
+from fractions import Fraction
 
 # 确保 user site-packages 在 sys.path（conda base 会设 PYTHONNOUSERSITE=1，导致 pip 安装的 av 找不到）
 try:
@@ -246,9 +247,10 @@ def mux_video(prefix, pts_file, raw_file, out_path, dump_file=None,
     # Create output mp4
     output = av.open(out_path, mode='w', format='mp4')
     out_stream = output.add_stream_from_template(in_stream)
-    out_stream.time_base = av.time_base  # 1/1000000
-
-    # Need SPS/PPS as extradata for mp4 container
+    # v4.3.7: explicit µs time base (Fraction). Without it, PyAV interprets our
+    # µs ints at the INPUT stream's time scale → compressed/shifted durations.
+    US_TB = Fraction(1, 1_000_000)
+    out_stream.time_base = US_TB
     if in_stream.codec_context.extradata:
         out_stream.codec_context.extradata = in_stream.codec_context.extradata
 
@@ -256,9 +258,10 @@ def mux_video(prefix, pts_file, raw_file, out_path, dump_file=None,
     for packet in input_container.demux(in_stream):
         if packet.size == 0:
             continue
-        # PTS = 原始（显示序，可能不单调 — B 帧重排产物）
+        # PTS = 原始（显示序，可能不单调 — B 帧重排产物），单位 µs
+        packet.time_base = US_TB
         packet.pts = pts_list[pts_idx]
-        # DTS = 单调（解码序）— mp4 muxer 硬要求
+        # DTS = 单调（解码序），µs — mp4 muxer 硬要求 DTS 单调
         packet.dts = dts_list[pts_idx]
         packet.stream = out_stream
         output.mux(packet)
@@ -301,14 +304,16 @@ def mux_audio(prefix, pts_file, raw_file, out_path):
 
     output = av.open(out_path, mode='w', format='mp4')
     out_stream = output.add_stream_from_template(in_stream)
-    out_stream.time_base = av.time_base  # 1/1000000
-
+    # v4.3.7: explicit µs time base (Fraction) — see video path note above.
+    US_TB = Fraction(1, 1_000_000)
+    out_stream.time_base = US_TB
     pts_idx = 0
     for packet in input_container.demux(in_stream):
         if pts_idx >= len(pts_list):
             break
         if packet.size == 0:
             continue
+        packet.time_base = US_TB
         packet.pts = pts_list[pts_idx]
         packet.dts = pts_list[pts_idx]
         packet.stream = out_stream

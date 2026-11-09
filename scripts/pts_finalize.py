@@ -31,6 +31,7 @@ import os
 import argparse
 
 JUMP_THRESHOLD_S_DEFAULT = 5.0
+BACKWARD_SPLIT_MS_DEFAULT = 500
 
 
 def parse_input(path):
@@ -62,26 +63,31 @@ def parse_input(path):
     return rows
 
 
-def split_by_pts_jump(rows, threshold_us):
-    """Detect pts_us jumps > threshold_us between consecutive rows (in DTS order).
+def split_by_pts_jump(rows, threshold_us, backward_threshold_us=None):
+    """Detect pts_us jumps between consecutive rows (in DTS order).
 
     rows are expected to be sorted by frame_index (i.e. decoder order).
-    A jump is defined as: abs(rows[i].pts_us - rows[i-1].pts_us) > threshold_us.
-    BOTH forward and backward jumps trigger a split.
 
-    Rationale: within a single video stream, pts_us only varies within ~1 frame
-    interval (B-frame reordering, typically <200ms for 30fps). Large forward
-    jumps indicate a stream forward skip (episode change, dump restart).
-    Large backward jumps indicate a stream wraparound / PTS reset (firefox dump
-    quirk where warmup-like PTS appears late in DTS — must be isolated into
-    its own segment, not mixed with the main video frames).
+    Split conditions (v4.3.7): forward jump > threshold_us (default 5s), OR
+    backward jump > backward_threshold_us (default 500ms).
+
+    Rationale: within a single video stream, pts_us only varies within ~1 GOP
+    (B-frame reordering moves PTS backwards by at most the reference distance,
+    typically <200ms). Large FORWARD jumps indicate a stream skip (episode
+    change, dump restart). Large BACKWARD jumps (>500ms) indicate a clock
+    reset — e.g. a preview/teaser clip whose PTS restarts near zero before
+    the main content (must be isolated into its own segment, not mixed with
+    the main video frames; v4.3.6 and earlier required a >5s gap for this).
     """
+    if backward_threshold_us is None:
+        backward_threshold_us = int(BACKWARD_SPLIT_MS_DEFAULT * 1000)
     if not rows:
         return []
     segments = [[rows[0]]]
     for r in rows[1:]:
         prev = segments[-1][-1]
-        if abs(r['pts_us'] - prev['pts_us']) > threshold_us:
+        delta = r['pts_us'] - prev['pts_us']
+        if delta > threshold_us or delta < -backward_threshold_us:
             segments.append([r])
         else:
             segments[-1].append(r)
@@ -97,7 +103,12 @@ def main():
                         help='Output file (default: <input>.final.pts)')
     parser.add_argument('--jump-threshold-s', type=float,
                         default=JUMP_THRESHOLD_S_DEFAULT,
-                        help=f'PTS jump threshold in seconds (default: {JUMP_THRESHOLD_S_DEFAULT})')
+                        help=(f'Forward PTS jump threshold in seconds '
+                              f'(default: {JUMP_THRESHOLD_S_DEFAULT})'))
+    parser.add_argument('--backward-split-ms', type=int,
+                        default=BACKWARD_SPLIT_MS_DEFAULT,
+                        help=(f'Backward PTS jump split threshold in ms '
+                              f'(v4.3.7, default: {BACKWARD_SPLIT_MS_DEFAULT})'))
     args = parser.parse_args()
 
     # Default output path: <input>.final.pts (preserve original)
@@ -118,11 +129,14 @@ def main():
                   f"results may be wrong", file=sys.stderr)
             break
 
-    # 1. Split into segments by pts_us jump (> threshold, in DTS order)
+    # 1. Split into segments by pts_us jumps (in DTS order):
+    #    forward > --jump-threshold-s OR backward > --backward-split-ms
     threshold_us = int(args.jump_threshold_s * 1_000_000)
-    segments = split_by_pts_jump(rows, threshold_us)
-    print(f"split into {len(segments)} segment(s) by pts_us jump > "
-          f"{args.jump_threshold_s}s", file=sys.stderr)
+    backward_us = int(args.backward_split_ms * 1000)
+    segments = split_by_pts_jump(rows, threshold_us, backward_us)
+    print(f"split into {len(segments)} segment(s): forward jump > "
+          f"{args.jump_threshold_s}s or backward jump > {args.backward_split_ms}ms",
+          file=sys.stderr)
     for i, seg in enumerate(segments):
         seg_span_us = seg[-1]['pts_us'] - seg[0]['pts_us']
         print(f"  segment {i}: {len(seg):>5} frames, "

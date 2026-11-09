@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.3.5 统一入口
+# firefox-stream-fetch capture.sh — v4.3.7 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -49,7 +49,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.3.5
+firefox-stream-fetch 统一抓取脚本 v4.3.7
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -896,6 +896,13 @@ mux_to_mp4() {
     local tmp_v="${out}.tmpv.mp4"
     local extractor="${SCRIPT_DIR}/sdfv_extract.py"
     local muxer_py="${SCRIPT_DIR}/mux_with_pts.py"
+    # v4.3.7: PyAV 解释器钉死（可用 MUX_PY 覆盖）。PTS 保真封装要求 'av' 可导入；
+    # 缺失时显著告警，避免静默降级成 fps-guess 兜底导致音画错位。
+    local mux_py="${MUX_PY:-python3}"
+    if ! "$mux_py" -c "import av" >/dev/null 2>&1; then
+        echo "  ⚠️  [$mux_py] 无法 import 'av'(PyAV) → PTS 封装将回退 ffmpeg fps-guess（音画可能错位）"
+        echo "      修复: export MUX_PY=<装有 PyAV 的 python>"
+    fi
     local extracted_raw="${base}.raw"
     local extracted_pts="${base}.pts"
     local tmp_v_py="${out}.tmpv_py.mp4"  # PyAV 输出（保留原始 PTS）
@@ -997,7 +1004,7 @@ mux_to_mp4() {
         fi
 
         # PyAV 封装：每帧写入实际 PTS，保留与 dump 一致的时间轴
-        if python3 "$muxer_py" "$base" video --audio-duration-us "$audio_duration_us" 2>&1 | tee /tmp/mux_py.log; then
+        if "$mux_py" "$muxer_py" "$base" video --audio-duration-us "$audio_duration_us" 2>&1 | tee /tmp/mux_py.log; then
             local py_v="${base}.mp4"
             if [ -s "$py_v" ]; then
                 tmp_v_py="$py_v"
@@ -1045,7 +1052,8 @@ mux_to_mp4() {
         fi
     fi
 
-    rm -f "$extracted_raw" "$extracted_pts"
+    # v4.3.6+: extracted_raw/pts 清理移到音频合并之后（原位置过早，算 A/V 偏移时 $extracted_pts
+    # 必为空 → sync_off 永远算不出，v4.3.5 的 A/V itsoffset 对齐逻辑实际从未生效）
 
     if [ ! -f "$tmp_v_py" ]; then
         echo "  ⚠️  无视频 dump，跳过封装"
@@ -1057,6 +1065,10 @@ mux_to_mp4() {
         local extracted_a_raw="${audio%.aac}.raw"
         local extracted_a_pts="${audio%.aac}.pts"
         local tmp_a_py="${audio%.aac}.m4a"
+        # v4.3.6+: -itsoffset 仅在非空时追加（空值会让 ffmpeg 报错 → 回退链一路失败 → 音轨静默丢失）；
+        # fallback 输入优先用已提取的 ADTS（SDFA 原始 dump ffmpeg 无法直接 demux）。默认指向 $audio（旧 ADTS 流）。
+        local TS_ARGS=()
+        local A_IN="$audio"
 
         if python3 "$extractor" "$audio" >/dev/null 2>&1 && [ -s "$extracted_a_raw" ] && [ -s "$extracted_a_pts" ]; then
             # v4.3.5+: 计算 A/V PTS 偏移。如果 dump 里 video/audio 首帧 PTS 有偏移 (>50ms)，
@@ -1075,8 +1087,11 @@ mux_to_mp4() {
                     fi
                 fi
             fi
+            # v4.3.6+: extractor 成功 → ffmpeg 侧输入改用已提取 ADTS；sync_off 定稿后构造 itsoffset 参数
+            [ -s "$extracted_a_raw" ] && A_IN="$extracted_a_raw"
+            [ -n "$sync_off" ] && TS_ARGS=(-itsoffset "$sync_off")
             # PyAV 封装音频（保留 PTS）
-            if python3 "$muxer_py" "${audio%.aac}" audio 2>&1 | tee -a /tmp/mux_py.log; then
+            if "$mux_py" "$muxer_py" "${audio%.aac}" audio 2>&1 | tee -a /tmp/mux_py.log; then
                 if [ -s "$tmp_a_py" ]; then
                     echo "  ✅ PyAV 音频 mux 成功"
                     # ffmpeg 合并两个 mp4，保留双方 PTS 时间轴
@@ -1089,13 +1104,13 @@ mux_to_mp4() {
                         -c copy -map 0:v:0 -map 1:a:0 \
                         -movflags +faststart "$out" -loglevel error || {
                             echo "  ⚠️  PTS 合并失败，尝试默认合并"
-                            ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$tmp_a_py" -c copy "$out" -loglevel error || {
+                            ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$tmp_a_py" -c copy "$out" -loglevel error || {
                                 mv "$tmp_v_py" "$out"; return 1; }
                         }
                     rm -f "$tmp_v_py" "$tmp_a_py"
                 else
                     echo "  ⚠️  PyAV 音频输出为空，回退"
-                    ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+                    ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$A_IN" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
                 fi
             else
                 echo "  ⚠️  PyAV 音频 mux 失败，回退"
@@ -1104,9 +1119,9 @@ mux_to_mp4() {
                 ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
                 [ -z "$ar" ] && ar="44100"
                 [ -z "$ch" ] && ch="2"
-                ffmpeg -y -ar "$ar" -ac "$ch" -i "$audio" -c:a copy "$tmp_a_py" -loglevel error || {
-                    ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
-                } && ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+                ffmpeg -y -ar "$ar" -ac "$ch" -i "$A_IN" -c:a copy "$tmp_a_py" -loglevel error || {
+                    ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$A_IN" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+                } && ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
             fi
         else
             # fallback: 旧 ADTS 流
@@ -1115,16 +1130,18 @@ mux_to_mp4() {
             ch=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$audio" 2>/dev/null | head -1)
             [ -z "$ar" ] && ar="44100"
             [ -z "$ch" ] && ch="2"
-            ffmpeg -y -ar "$ar" -ac "$ch" -i "$audio" -c:a copy "$tmp_a_py" -loglevel error || {
-                ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$audio" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
-            } && ffmpeg -y -i "$tmp_v_py" -itsoffset "$sync_off" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+            ffmpeg -y -ar "$ar" -ac "$ch" -i "$A_IN" -c:a copy "$tmp_a_py" -loglevel error || {
+                ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$A_IN" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
+            } && ffmpeg -y -i "$tmp_v_py" "${TS_ARGS[@]}" -i "$tmp_a_py" -c copy -map 0:v:0 -map 1:a:0 -movflags +faststart "$out" -loglevel error || { mv "$tmp_v_py" "$out"; return 1; }
         fi
         rm -f "$extracted_a_raw" "$extracted_a_pts"
     else
         mv "$tmp_v_py" "$out"
     fi
 
-    # 统一清理临时 mp4/m4a（多分支中部分路径漏了 rm .tmpv.mp4/.tmp_a_py，留在 OUTPUT_DIR 变垃圾）
+    rm -f "$extracted_raw" "$extracted_pts"
+
+    # 统一清理临时 mp4/m4a（多分支中部分路径漏了 rm .tmpv.mp4/.m4a，留在 OUTPUT_DIR 变垃圾）
     rm -f "$tmp_v_py" "$tmp_a_py"
 
     echo "  ✅ mp4: $out"
@@ -1142,7 +1159,7 @@ mux_to_mp4() {
 main() {
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.3.0                              ║"
+    echo "║  firefox-stream-fetch v4.3.7                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"

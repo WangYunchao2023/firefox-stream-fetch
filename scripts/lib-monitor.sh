@@ -468,6 +468,11 @@ monitor_run() {
         last_ff_url=$(jq -r '.last_ff_url // empty' "$sidecar" 2>/dev/null)
         local prev_pts_us
         prev_pts_us=$(jq -r '.last_dump_pts_us // 0' "$sidecar" 2>/dev/null)
+        # v4.3.6+: 切集 URL 比较只用 path 部分（去掉 ?query/#fragment），
+        # 防止页面只加参数（如 ?id=...）被误判为下一集而提前收尾
+        local cur_url_path last_url_path
+        cur_url_path=$(printf '%s' "$cur_ff_url" | sed -E 's/[?#].*$//')
+        last_url_path=$(printf '%s' "$last_ff_url" | sed -E 's/[?#].*$//')
 
         local next_ep_url=""
         local next_ep_source=""
@@ -482,7 +487,7 @@ monitor_run() {
 
         # 信号 2: firefox URL 变化（持久化在 sidecar，跨 firefox URL 切换可靠）
         if [ -n "$cur_ff_url" ] && [ "$cur_ff_url" != "null" ] && \
-           [ "$cur_ff_url" != "$last_ff_url" ]; then
+           [ "$cur_url_path" != "$last_url_path" ]; then
             case "$cur_ff_url" in
                 about:*)
                     # firefox 跳到 about:* 是用户回退/输入中,不是下一集
@@ -527,7 +532,7 @@ monitor_run() {
         if [ -n "$next_ep_url" ]; then
             # 例外 1：如果视频刚 ended 且 firefox URL 还没变（页面刚播完但还未跳转），不要切集
             # 这时走 ended 分支正常结束，捕获最后一帧
-            if [ "$video_state" = "ended" ] && [ "$cur_ff_url" = "$last_ff_url" ]; then
+            if [ "$video_state" = "ended" ] && [ "$cur_url_path" = "$last_url_path" ]; then
                 _monitor_debug "⏭️  video_state=ended 且 URL 未变，走 ended 分支 ($next_ep_source: $next_ep_url)"
             else
                 # 真切集信号：触发 roll
