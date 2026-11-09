@@ -139,6 +139,8 @@ def main():
     parser = argparse.ArgumentParser(description='Parse SDFV/SDFA dump to .raw + .pts')
     parser.add_argument('input', help='Input dump file')
     parser.add_argument('pts_offset', nargs='?', type=int, default=0, help='PTS offset in microseconds')
+    parser.add_argument('out_prefix', nargs='?', default=None,
+                        help='Output prefix for .raw/.pts (default: <input> minus extension)')
     parser.add_argument('--last-pts-only', action='store_true', help='Only print last frame PTS')
     parser.add_argument('--detect-first-keyframe', action='store_true', help='Detect first IDR frame index and print it')
     args = parser.parse_args()
@@ -148,7 +150,8 @@ def main():
     last_only = args.last_pts_only
     detect_keyframe = args.detect_first_keyframe
 
-    base, _ext = os.path.splitext(inp)
+    # v4.3.9: 输出前缀可显式指定 — 视频/音频提取共用同一目录时避免互相覆盖同名文件
+    base = args.out_prefix if args.out_prefix else os.path.splitext(inp)[0]
     raw_out = base + '.raw'
     pts_out = base + '.pts'
 
