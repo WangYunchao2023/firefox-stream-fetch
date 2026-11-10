@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.3.9 统一入口
+# firefox-stream-fetch capture.sh — v4.4.0 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -7,7 +7,7 @@
 # URL — 可选。不填则 Phase 1 开 about:newtab，用户在 Firefox 地址栏手动输入
 # OPTIONS:
 #   --output DIR              保存目录（默认：~/Videos/firefox抓取/）
-#   --auto-next               playlist 自动连集（占位：v3.1 实现 monitor 侧切集检测）
+#   --auto-next [N]           playlist 自动连集；带 N → 抓满 N 集（含起始集）自动终止，不带 N → 抓到最后一集
 #   --skip-phase1             跳过 Phase 1（profile 已有 cf_clearance 时等价行为）
 #   --keep-h264               保留 .h264/.aac 中间文件（默认封 mp4 后清理）
 #   --profile PATH            指定 profile 路径（默认按 URL host 自动命名）
@@ -34,6 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ═══════════════════════════════════════════════════════════════════════
 OUTPUT_DIR="$HOME/Videos/firefox抓取"
 AUTO_NEXT=0
+MAX_EPISODES=0        # 0 = 不限；>0 = 共抓满该集数后自动终止（v4.4.0，由 --auto-next N 指定）
 SKIP_PHASE1=0
 KEEP_H264=1
 ONLY_MP4=0
@@ -43,7 +44,15 @@ PROFILE_PATH=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --output)          OUTPUT_DIR="$2"; shift 2;;
-        --auto-next)       AUTO_NEXT=1; shift;;
+        --auto-next)
+            AUTO_NEXT=1
+            shift
+            # v4.4.0: 可选集数上限 — --auto-next N → 共抓最多 N 集（含起始集），不带 N → 不限
+            if [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ]; then
+                MAX_EPISODES="$1"
+                shift
+            fi
+            ;;
         --skip-phase1)     SKIP_PHASE1=1; shift;;
         --keep-h264)       KEEP_H264=1; shift;;
         --only-mp4)        ONLY_MP4=1; shift;;
@@ -51,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.3.9
+firefox-stream-fetch 统一抓取脚本 v4.4.0
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -62,7 +71,8 @@ URL:
 
 OPTIONS:
     --output DIR              mp4 保存目录（默认：~/Videos/firefox抓取/）
-    --auto-next               playlist 自动连集（每集独立 mp4：host-01.mp4, host-02.mp4...）
+    --auto-next [N]           playlist 自动连集（每集独立 mp4：host-01.mp4, host-02.mp4...
+                              ）；带 N → 共抓满 N 集（含起始集）后自动终止，不带 N → 抓到最后一集
     --skip-phase1             跳过 Phase 1（profile 已有可用 cookie 时等价行为）
     --keep-h264               保留 .h264/.aac 中间 dump（默认不删）
     --only-mp4                封装成功后删除全部中间文件，仅保留最终 .mp4（默认：全部保留）
@@ -72,7 +82,8 @@ OPTIONS:
 例子:
     capture.sh
     capture.sh https://www.olevod.com/player/vod/1-82695-1.html
-    capture.sh https://www.yfsp.tv/watch?v=ztgsSWh5mPZEhhazLjYUG6 --auto-next
+    capture.sh https://www.yfsp.tv/watch?v=ztgsSWh5mPZEhhazLjYUG6 --auto-next          # 抓到最后一集
+    capture.sh https://www.yfsp.tv/watch?v=ztgsSWh5mPZEhhazLjYUG6 --auto-next 3        # 只抓前 3 集
     capture.sh https://www.youtube.com/watch?v=_n4SRDYkhqs --keep-h264
     capture.sh https://example.com/video --proxy socks5://127.0.0.1:1080
 
@@ -1167,14 +1178,22 @@ mux_to_mp4() {
 # ═════════════════════════════════════════════════
 
 main() {
+    local auto_next_desc="❌"
+    if [ "$AUTO_NEXT" -eq 1 ]; then
+        if [ "$MAX_EPISODES" -gt 0 ]; then
+            auto_next_desc="✅ (≤${MAX_EPISODES} 集)"
+        else
+            auto_next_desc="✅ (抓到最后一集)"
+        fi
+    fi
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.3.9                              ║"
+    echo "║  firefox-stream-fetch v4.4.0                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
     echo "  Output:        $OUTPUT_DIR"
-    echo "  Auto-next:     $([ $AUTO_NEXT -eq 1 ] && echo '✅' || echo '❌')"
+    echo "  Auto-next:     $auto_next_desc"
     echo "  Only-mp4:      $([ $ONLY_MP4 -eq 1 ] && echo '✅ 删中间文件' || echo '❌ 保留中间文件(默认)')" 
     echo ""
 
@@ -1200,14 +1219,19 @@ main() {
             next_url=$(jq -r '.next_url // empty' "$sidecar" 2>/dev/null)
             if [ -n "$next_url" ] && [ "$next_url" != "null" ]; then
                 if [ $AUTO_NEXT -eq 1 ]; then
-                    echo ""
-                    echo "═══════════════════════════════════════════════════════"
-                    echo "  ⏭️  自动切下一集 (--auto-next): $next_url"
-                    echo "═══════════════════════════════════════════════════════"
-                    URL="$next_url"
-                    episode=$((episode + 1))
-                    export EPISODE=$episode
-                    continue
+                    # v4.4.0: 集数上限 — 本集已计入 $episode；达到 MAX_EPISODES 则不再切下一集，落到 break 走正常清理
+                    if [ "$MAX_EPISODES" -gt 0 ] && [ "$episode" -ge "$MAX_EPISODES" ]; then
+                        echo "🛑 已达到指定集数上限（--auto-next ${MAX_EPISODES}）：共抓 $episode 集，自动终止"
+                    else
+                        echo ""
+                        echo "═══════════════════════════════════════════════════════"
+                        echo "  ⏭️  自动切下一集 (--auto-next): $next_url"
+                        echo "═══════════════════════════════════════════════════════"
+                        URL="$next_url"
+                        episode=$((episode + 1))
+                        export EPISODE=$episode
+                        continue
+                    fi
                 else
                     echo ""
                     echo "ℹ️  检测到下一集但未开启 --auto-next，当前集已保存为 mp4："
@@ -1256,4 +1280,4 @@ main() {
     ls -lh "$OUTPUT_DIR"/${BASE_NAME}*.mp4 2>/dev/null | head -5
 }
 
-main "$@"══════════════════════
+main "$@"

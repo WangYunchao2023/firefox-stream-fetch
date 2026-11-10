@@ -335,7 +335,7 @@ Offset  Size  内容
 |---|---|
 | `[URL]` | 可选，不填则 Phase 1 开 about:newtab |
 | `--output DIR` | 保存目录（默认 `~/Videos/firefox抓取/`） |
-| `--auto-next` | 自动连集 |
+| `--auto-next [N]` | 自动连集；带 N → 共抓满 N 集（含起始集）后自动终止，不带 N → 抓到最后一集 |
 | `--skip-phase1` | 跳过 Phase 1 |
 | `--keep-h264` | 保留 .h264/.aac 中间文件 |
 | `--profile PATH` | 指定 profile 路径 |
@@ -357,6 +357,7 @@ Offset  Size  内容
 | `PROFILE` | profile 路径 |
 | `OUTPUT_DIR` | 输出目录 |
 | `AUTO_NEXT` | 自动连集标志 |
+| `MAX_EPISODES` | 集数上限（0 = 不限；v4.4.0 由 `--auto-next N` 指定） |
 
 ### 5.2 lib-sidecar.sh
 
