@@ -29,6 +29,7 @@ _LIB_MONITOR_LOADED=1
 : "${MONITOR_MAX_INTERRUPTS:=3}"      # firefox 崩溃自动恢复最多几次
 : "${MONITOR_BIDI_PORT:=9222}"
 : "${MONITOR_INTERVAL:=5}"
+: "${MONITOR_MIN_PLAY_FOR_SWITCH:=5}" # v4.4.1: 累计播放不足此时长时，PTS 回跳视为缓冲抖动而非切集（秒）
 : "${MONITOR_DEBUG:=0}"
 : "${PROJECT_ROOT:=/home/wangyc/Documents/软件类工作/firefox-stream-fetch}"
 : "${BIDI_STATE:=${PROJECT_ROOT}/scripts/bidi-state.py}"
@@ -290,6 +291,7 @@ monitor_run() {
     local manual_url_mode="${7:-0}"
 
     local stall_count=0 paused_count=0 interrupt_count=0
+    local played_seconds=0   # v4.4.1: 累计真实播放时长（仅 playing 且 dump 增长时累加）
     local last_size_v=0 last_size_a=0
     local state="init" ff_pid=""
     local end_reason="unknown"
@@ -514,9 +516,15 @@ monitor_run() {
         if [ -z "$next_ep_url" ] && [ -n "$cur_pts_us" ] && [ "$cur_pts_us" != "0" ] && [ "$prev_pts_us" != "0" ]; then
             # PTS 回跳（小于前一帧） = 新视频开始
             if [ "$cur_pts_us" -lt "$prev_pts_us" ]; then
-                _monitor_log "⏭️  PTS 跳变检测到切集: ${prev_pts_us}us → ${cur_pts_us}us"
-                next_ep_url="$cur_ff_url"  # 续用当前 URL（SPA 切 src 同页面）
-                next_ep_source="pts-jump"
+                # v4.4.1: 开头缓冲期门槛 — 还没稳定播起来时（如网络慢、预缓冲时间线重置），
+                # PTS 回跳多为噪声，不当作切集；真正切集都发生在稳定播放之后
+                if [ "$played_seconds" -ge "$MONITOR_MIN_PLAY_FOR_SWITCH" ]; then
+                    _monitor_log "⏭️  PTS 跳变检测到切集: ${prev_pts_us}us → ${cur_pts_us}us"
+                    next_ep_url="$cur_ff_url"  # 续用当前 URL（SPA 切 src 同页面）
+                    next_ep_source="pts-jump"
+                else
+                    _monitor_log "⚠️  PTS 回跳但仅播放 ${played_seconds}s（<${MONITOR_MIN_PLAY_FOR_SWITCH}s），视为缓冲抖动忽略: ${prev_pts_us}us → ${cur_pts_us}us"
+                fi
             fi
         fi
         # 更新 last_pts（无论是否切集，下一轮比较用）
@@ -636,6 +644,7 @@ monitor_run() {
                     _monitor_log "▶  $current_time/$duration (v+$((size_v-last_size_v)) a+$((size_a-last_size_a)))"
                     stall_count=0
                     state="playing"
+                    played_seconds=$((played_seconds + MONITOR_INTERVAL))
                     local kpts
                     kpts=$(awk -v t="$current_time" 'BEGIN{printf "%.2f", t-5}')
                     [ "$(awk -v t="$kpts" 'BEGIN{print (t<0)?1:0}')" = "1" ] && kpts=0

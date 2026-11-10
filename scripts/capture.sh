@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.4.0 统一入口
+# firefox-stream-fetch capture.sh — v4.4.1 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -34,7 +34,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ═══════════════════════════════════════════════════════════════════════
 OUTPUT_DIR="$HOME/Videos/firefox抓取"
 AUTO_NEXT=0
-MAX_EPISODES=0        # 0 = 不限；>0 = 共抓满该集数后自动终止（v4.4.0，由 --auto-next N 指定）
+MAX_EPISODES=0        # 0 = 不限；>0 = 共抓满该集数后自动终止（功能自 v4.4.0 引入，由 --auto-next N 指定）
 SKIP_PHASE1=0
 KEEP_H264=1
 ONLY_MP4=0
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.4.0
+firefox-stream-fetch 统一抓取脚本 v4.4.1
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -1188,7 +1188,7 @@ main() {
     fi
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.4.0                              ║"
+    echo "║  firefox-stream-fetch v4.4.1                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
