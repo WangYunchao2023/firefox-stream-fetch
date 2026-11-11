@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.4.2 统一入口
+# firefox-stream-fetch capture.sh — v4.5.0 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.4.2
+firefox-stream-fetch 统一抓取脚本 v4.5.0
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -1188,7 +1188,7 @@ main() {
     fi
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.4.2                              ║"
+    echo "║  firefox-stream-fetch v4.5.0                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"
@@ -1202,10 +1202,17 @@ main() {
 
     local phase2_ret=0
     local episode=1
+    # v4.5.0: 本 run 内首个成功 Phase 1 后 profile 视为已热身 —— 后续集直接复用认证态（登录型站点不再丢 session）
+    local warm_profile=0
     export EPISODE=$episode
     while true; do
-        if [ $SKIP_PHASE1 -eq 0 ]; then
+        # 跳过条件：显式 --skip-phase1，或本 run 已完成过 Phase 1（含 CF cookie 闸门命中的情况）
+        if [ $SKIP_PHASE1 -eq 0 ] && [ $warm_profile -eq 1 ]; then
+            echo ""
+            echo "✅ 复用已热身 profile（本轮 Phase 1 的认证/指纹/cookie 保留），跳过 Phase 1"
+        elif [ $SKIP_PHASE1 -eq 0 ]; then
             phase1 || { echo "❌ Phase 1 失败"; return 1; }
+            warm_profile=1
         fi
         phase2 || phase2_ret=$?
         
