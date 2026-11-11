@@ -79,8 +79,15 @@ sidecar_set() {
     _sidecar_require_jq || return 1
     local path="$1" key="$2" value="$3"
     local tmp="${path}.tmp.$$"
-    jq --arg k "$key" --argjson v "$value" '.[$k] = $v | .last_updated = (now | todate)' \
-        "$path" > "$tmp" && mv "$tmp" "$path"
+    if ! jq --arg k "$key" --argjson v "$value" '.[$k] = $v | .last_updated = (now | todate)' \
+        "$path" > "$tmp"; then
+        # v4.4.2: fail loudly — non-JSON values previously failed silently, leaving fields like
+        # next_url unwritten and auto-next stopping without any trace
+        echo "⚠️  sidecar_set failed (not valid JSON?): key=$key value='$value'" >&2
+        rm -f "$tmp"
+        return 1
+    fi
+    mv "$tmp" "$path"
 }
 
 # 添加一个分段

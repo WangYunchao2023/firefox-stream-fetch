@@ -551,7 +551,8 @@ monitor_run() {
 
                 if [ "${_do_next_episode_roll:-0}" = "1" ]; then
                     _monitor_log "⏭️  检测到下一集 ($next_ep_source): $next_ep_url"
-                    sidecar_set "$sidecar" next_url "$next_ep_url"
+                    # v4.4.2: value must be JSON; bare URL broke --argjson and silently skipped the write
+                    sidecar_set "$sidecar" next_url "\"$next_ep_url\""
                     sidecar_set "$sidecar" episode_index "$((episode_index + 1))"
                     sidecar_set "$sidecar" last_ff_url "\"$cur_ff_url\""
                     sidecar_set "$sidecar" last_dump_pts_us "0"  # 重置，新集重新建立基线
