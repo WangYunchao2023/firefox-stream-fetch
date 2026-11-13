@@ -1,5 +1,5 @@
 #!/bin/bash
-# firefox-stream-fetch capture.sh — v4.5.0 统一入口
+# firefox-stream-fetch capture.sh — v4.5.1 统一入口
 #
 # 用法:
 #   capture.sh [URL] [OPTIONS]
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
         --proxy)           FORCE_PROXY="$2"; shift 2;;
         --help|-h)
             cat <<HELP
-firefox-stream-fetch 统一抓取脚本 v4.5.0
+firefox-stream-fetch 统一抓取脚本 v4.5.1
 
 用法:
     capture.sh [URL] [OPTIONS]
@@ -1188,7 +1188,7 @@ main() {
     fi
     echo ""
     echo "╔════════════════════════════════════════════════════════════╗"
-    echo "║  firefox-stream-fetch v4.5.0                              ║"
+    echo "║  firefox-stream-fetch v4.5.1                              ║"
     echo "╚════════════════════════════════════════════════════════════╝"
     echo "  URL:           ${URL:-（空白页，手动输入）}"
     echo "  Profile:       $PROFILE"

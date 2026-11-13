@@ -30,6 +30,7 @@ _LIB_MONITOR_LOADED=1
 : "${MONITOR_BIDI_PORT:=9222}"
 : "${MONITOR_INTERVAL:=5}"
 : "${MONITOR_MIN_PLAY_FOR_SWITCH:=5}" # v4.4.1: 累计播放不足此时长时，PTS 回跳视为缓冲抖动而非切集（秒）
+: "${END_GRACE_POLLS:=4}"           # v4.5.1: --auto-next 下 video.ended 后的宽限轮数（5s × 4 = 20s），等待站点自动跳转
 : "${MONITOR_DEBUG:=0}"
 : "${PROJECT_ROOT:=/home/wangyc/Documents/软件类工作/firefox-stream-fetch}"
 : "${BIDI_STATE:=${PROJECT_ROOT}/scripts/bidi-state.py}"
@@ -290,7 +291,7 @@ monitor_run() {
     local dump_video="$4" dump_audio="$5" sidecar="$6"
     local manual_url_mode="${7:-0}"
 
-    local stall_count=0 paused_count=0 interrupt_count=0
+    local stall_count=0 paused_count=0 interrupt_count=0 ended_grace=0
     local played_seconds=0   # v4.4.1: 累计真实播放时长（仅 playing 且 dump 增长时累加）
     local last_size_v=0 last_size_a=0
     local state="init" ff_pid=""
@@ -616,9 +617,24 @@ monitor_run() {
         # --- 4. 按场景处理 ---
         case "$video_state" in
             ended)
-                _monitor_log "✅ video.ended → 立即结束"
-                end_reason="ended"
-                break
+                if [ "${AUTO_NEXT:-0}" = "1" ]; then
+                    # v4.5.1: ended 后给站点一个宽限窗口等自动跳转。期间任一切集信号
+                    # （URL 变化 / bidi next_episode / PTS 跳变，见上方三信号逻辑）出现即正常 roll；
+                    # 超时仍无信号才按 ended 结束。非 --auto-next 行为不变（立即结束）。
+                    ended_grace=$((ended_grace + 1))
+                    if [ $ended_grace -eq 1 ]; then
+                        _monitor_log "✅ video.ended → 进入 $((END_GRACE_POLLS*MONITOR_INTERVAL))s 宽限窗（--auto-next），等待下一集跳转..."
+                    fi
+                    if [ $ended_grace -ge "$END_GRACE_POLLS" ]; then
+                        _monitor_log "⏱️  宽限窗内未检测到切集信号，按 ended 结束"
+                        end_reason="ended"
+                        break
+                    fi
+                else
+                    _monitor_log "✅ video.ended → 立即结束"
+                    end_reason="ended"
+                    break
+                fi
                 ;;
             no-video)
                 _monitor_log "⚠️  页面没 video 元素"
